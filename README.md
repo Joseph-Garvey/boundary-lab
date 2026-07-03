@@ -56,6 +56,26 @@ GPU solving VRAM requirements scale quadratically with mesh element count. Below
 
 ##
 
+### BEAT Engine Metal GPU Solver Requirements (Apple Silicon)
+
+* macOS on Apple Silicon (M1 or newer)
+* [Julia](https://julialang.org/downloads/manual-downloads/) installed and available on `PATH`
+
+To prepare the Julia environment, from the repository root run:
+
+```bash
+julia --project=src/blab/solvers/julia_metal -e "using Pkg; Pkg.instantiate()"
+```
+
+The Metal backend is a hybrid: field evaluation runs on the Apple GPU (Metal.jl) while the
+Burton-Miller dense solve runs on the CPU through Apple's Accelerate framework (the AMX matrix
+coprocessor). Because Apple Silicon uses unified memory, this path is not bound by the discrete-GPU
+VRAM table above — it can address as much memory as the machine has. See
+[BEAT Engine Metal](docs/advanced/beat-engine-Metal.md) for details, including which kernels still
+require validation on Apple hardware.
+
+##
+
 ### BEAT Engine CPU Solver Requirements
 
 * Intel, AMD, or ARM CPU
@@ -111,9 +131,10 @@ blab server --host 127.0.0.1 --port 8765 --solver beat_cuda
 ```
 
 Supported server-side solver IDs are `bempp_cpu` for Bempp OpenCL CPU, `beat_cpu`,
-`beat_cuda`, and `beat_rocm`. ROCm is accepted as a server selector but the ROCm
+`beat_cuda`, `beat_rocm`, and `beat_metal`. ROCm is accepted as a server selector but the ROCm
 BEAT Engine implementation is still a placeholder and will report not implemented
-until that engine path is completed. For BEAT Engine solvers, use
+until that engine path is completed. `beat_metal` targets Apple Silicon and runs a Metal GPU /
+Accelerate hybrid (see [BEAT Engine Metal](docs/advanced/beat-engine-Metal.md)). For BEAT Engine solvers, use
 `--julia-executable` and `--julia-threads` to point the server at the intended
 Julia installation and thread count.
 
@@ -140,3 +161,4 @@ For Docker image deployment with the BEAT Engine CUDA solver, see
 - [BEAT Engine Core](docs/advanced/beat-engine-core.md)
 - [BEAT Engine CPU](docs/advanced/beat-engine-CPU.md)
 - [BEAT Engine CUDA](docs/advanced/beat-engine-CUDA.md)
+- [BEAT Engine Metal (Apple Silicon)](docs/advanced/beat-engine-Metal.md)

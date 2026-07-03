@@ -7,11 +7,13 @@ from blab.config import SimulationConfig
 from blab.live import FrequencyResult
 from blab.protocol import build_mesh_assets
 from blab.server import (
+    SERVER_SOLVER_BACKENDS,
     BackendServerSolver,
     BlabServer,
     JobOrchestrator,
     _build_arg_parser,
     normalize_server_solver_id,
+    server_solver_backend_id,
 )
 from blab.solvers.base import SolveMetadata
 
@@ -148,6 +150,14 @@ def test_server_parser_accepts_backend_solver_options() -> None:
         assert "cannot use another solve server" in str(exc)
     else:
         raise AssertionError("server should not be accepted as a server-side backend")
+
+
+def test_server_accepts_beat_metal_solver() -> None:
+    assert "beat_metal" in SERVER_SOLVER_BACKENDS
+    assert _build_arg_parser().parse_args(["--solver", "beat_metal"]).solver == "beat_metal"
+    assert normalize_server_solver_id("beat_metal") == "beat_metal"
+    assert normalize_server_solver_id("metal") == "beat_metal"
+    assert server_solver_backend_id("beat_metal") == "beat_metal"
 
 
 class CapturingBackend:

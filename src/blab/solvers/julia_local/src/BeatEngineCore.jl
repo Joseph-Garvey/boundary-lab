@@ -16,6 +16,13 @@ catch
     nothing
 end
 
+const METAL_MODULE = try
+    @eval import Metal
+    Metal
+catch
+    nothing
+end
+
 export BoundaryMesh,
     DP0Space,
     P1Space,
@@ -26,11 +33,14 @@ export BoundaryMesh,
     build_cuda_field_evaluation_cache,
     build_rocm_regular_assembly_cache,
     build_rocm_field_evaluation_cache,
+    build_metal_regular_assembly_cache,
+    build_metal_field_evaluation_cache,
     build_field_evaluation_cache,
     build_singular_correction_cache,
     assemble_regular_galerkin_operators_cpu,
     assemble_regular_galerkin_operators_cuda_regular,
     assemble_regular_galerkin_operators_rocm_regular,
+    assemble_regular_galerkin_operators_metal_regular,
     assemble_regular_galerkin_operators,
     adjacency_info,
     build_dp0_space,
@@ -40,6 +50,7 @@ export BoundaryMesh,
     evaluate_galerkin_field_cpu,
     evaluate_galerkin_field_cuda,
     evaluate_galerkin_field_rocm,
+    evaluate_galerkin_field_metal,
     fibonacci_sphere,
     helmholtz_adjoint_double_layer_kernel,
     helmholtz_double_layer_kernel,
@@ -72,6 +83,11 @@ end
 function amdgpu_module()
     AMDGPU_MODULE === nothing && error("ROCm solve requested, but AMDGPU.jl could not be loaded.")
     return AMDGPU_MODULE
+end
+
+function metal_module()
+    METAL_MODULE === nothing && error("Metal solve requested, but Metal.jl could not be loaded.")
+    return METAL_MODULE
 end
 
 struct BoundaryMesh{T<:AbstractFloat}
@@ -893,7 +909,31 @@ function assemble_regular_galerkin_operators(
         )
     end
 
-    error("Unsupported BEAT Engine assembly backend: $(backend). Expected :cpu, :cuda, or :rocm.")
+    if backend == :metal
+        accelerator_quadrature || error("Metal regular assembly requires accelerator_quadrature=true.")
+        # The Metal hybrid assembles operators on the Apple GPU but materializes the dense
+        # operators back to host memory (return_device=false) so the complex dense solve runs
+        # through the CPU/Accelerate path. Unified memory makes this copy-back inexpensive.
+        return assemble_regular_galerkin_operators_metal_regular(
+            mesh,
+            p1_space,
+            dp0_space,
+            k,
+            rule;
+            skip_singular=skip_singular,
+            singular_order=singular_order,
+            element_indices=element_indices,
+            cache=device_cache,
+            return_device=false,
+            accelerator_quadrature=true,
+            timing=timing,
+            singular_cache=singular_cache,
+            metal_singular_cache=device_singular_cache,
+            symmetry_mode=symmetry_mode,
+        )
+    end
+
+    error("Unsupported BEAT Engine assembly backend: $(backend). Expected :cpu, :cuda, :rocm, or :metal.")
 end
 
 function build_cuda_regular_assembly_cache(args...; kwargs...)
@@ -926,6 +966,22 @@ end
 
 function evaluate_galerkin_field_rocm(args...; kwargs...)
     error("ROCm field evaluation requested, but AMDGPU.jl is not loaded.")
+end
+
+function build_metal_regular_assembly_cache(args...; kwargs...)
+    error("Metal regular-pair assembly cache requested, but Metal.jl is not loaded.")
+end
+
+function assemble_regular_galerkin_operators_metal_regular(args...; kwargs...)
+    error("Metal regular-pair assembly requested, but Metal.jl is not loaded.")
+end
+
+function build_metal_field_evaluation_cache(args...; kwargs...)
+    error("Metal field-evaluation cache requested, but Metal.jl is not loaded.")
+end
+
+function evaluate_galerkin_field_metal(args...; kwargs...)
+    error("Metal field evaluation requested, but Metal.jl is not loaded.")
 end
 
 release_operator_storage!(operators) = nothing
@@ -1005,6 +1061,10 @@ end
 
 if AMDGPU_MODULE !== nothing
     include(joinpath(@__DIR__, "BeatEngineRocm.jl"))
+end
+
+if METAL_MODULE !== nothing
+    include(joinpath(@__DIR__, "BeatEngineMetal.jl"))
 end
 
 end

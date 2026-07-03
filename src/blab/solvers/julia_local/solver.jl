@@ -9,6 +9,18 @@ using .BeatEngineCore
 
 LinearAlgebra.BLAS.set_num_threads(Threads.nthreads())
 
+# On Apple Silicon the BEAT Engine Metal hybrid runs its dense Burton-Miller solve on the CPU
+# (Metal has no complex dense LU). Loading AppleAccelerate forwards Julia's LBT-backed
+# BLAS/LAPACK to Apple's Accelerate framework, which dispatches to the AMX matrix coprocessor.
+# It is a hard dependency only of the julia_metal project, so the import is best-effort and a
+# no-op for the CUDA/CPU/ROCm environments that do not ship it.
+const APPLE_ACCELERATE_MODULE = try
+    @eval import AppleAccelerate
+    AppleAccelerate
+catch
+    nothing
+end
+
 function emit_event(event_type::String; kwargs...)
     payload = Dict{String,Any}("type" => event_type)
     for (key, value) in kwargs
@@ -84,9 +96,12 @@ function beat_backend_from_request(request)
         "beat_rocm" => "rocm",
         "amd" => "rocm",
         "amdgpu" => "rocm",
+        "beat_metal" => "metal",
+        "apple" => "metal",
+        "mps" => "metal",
     )
     backend = get(aliases, backend, backend)
-    backend in ("cuda", "cpu", "rocm") || error("Unsupported BEAT Engine backend: $(backend). Expected cuda, cpu, or rocm.")
+    backend in ("cuda", "cpu", "rocm", "metal") || error("Unsupported BEAT Engine backend: $(backend). Expected cuda, cpu, rocm, or metal.")
     return Symbol(backend)
 end
 
@@ -454,6 +469,8 @@ function field_for_points(points, mesh, pressure, q_neumann, k, field_cache, bea
         return evaluate_galerkin_field_cuda(points, mesh, pressure, q_neumann, k, field_cache)
     elseif beat_backend == :rocm
         return evaluate_galerkin_field_rocm(points, mesh, pressure, q_neumann, k, field_cache)
+    elseif beat_backend == :metal
+        return evaluate_galerkin_field_metal(points, mesh, pressure, q_neumann, k, field_cache)
     elseif beat_backend == :cpu
         return evaluate_galerkin_field_cpu(points, mesh, pressure, q_neumann, k, field_cache)
     end
@@ -614,8 +631,14 @@ function solve_request(request)
     try
         solve_request_impl(request)
     finally
-        cleanup_cuda_after_solve!()
+        cleanup_device_after_solve!()
     end
+end
+
+function cleanup_device_after_solve!()
+    cleanup_cuda_after_solve!()
+    cleanup_metal_after_solve!()
+    return nothing
 end
 
 function cleanup_cuda_after_solve!()
@@ -633,6 +656,35 @@ function cleanup_cuda_after_solve!()
         try
             if isdefined(cuda, :reclaim)
                 cuda.reclaim()
+            end
+        catch
+        end
+    end
+
+    GC.gc(true)
+    return nothing
+end
+
+function cleanup_metal_after_solve!()
+    metal = BeatEngineCore.METAL_MODULE
+    metal === nothing && return nothing
+
+    try
+        if isdefined(metal, :synchronize)
+            metal.synchronize()
+        end
+    catch
+    end
+
+    GC.gc(true)
+
+    # Return cached Metal buffers to the system; the allocator name has shifted across
+    # Metal.jl versions, so probe defensively.
+    for reclaim_name in (:reclaim, :device_reset!)
+        try
+            if isdefined(metal, reclaim_name)
+                getproperty(metal, reclaim_name)()
+                break
             end
         catch
         end
@@ -709,6 +761,12 @@ function solve_request_impl(request)
         emit_event("status"; message="Initializing BEAT Engine using ROCm...")
         device_cache = build_rocm_regular_assembly_cache(mesh, rule)
         field_cache = build_rocm_field_evaluation_cache(cpu_field_cache)
+    elseif beat_backend == :metal
+        emit_event("status"; message="Initializing BEAT Engine using Apple Metal...")
+        device_cache = build_metal_regular_assembly_cache(mesh, rule)
+        field_cache = build_metal_field_evaluation_cache(cpu_field_cache)
+        # Phase 1 Metal hybrid applies singular corrections on the host (device_singular_cache
+        # stays nothing); the GPU Duffy path is a later optimization.
     else
         emit_event("status"; message="Initializing BEAT Engine using CPU...")
     end

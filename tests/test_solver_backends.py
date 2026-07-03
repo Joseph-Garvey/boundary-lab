@@ -8,11 +8,15 @@ from blab.solvers.base import SolveRequest
 from blab.solvers.beat_engine_backend import (
     DEFAULT_BEAT_ENGINE_CPU_PROJECT,
     DEFAULT_BEAT_ENGINE_CUDA_PROJECT,
+    DEFAULT_BEAT_ENGINE_METAL_PROJECT,
     DEFAULT_BEAT_ENGINE_ROCM_PROJECT,
     BeatEngineBackend,
+    BeatEngineMetalBackend,
     BeatEngineRocmBackend,
+    _default_beat_engine_project,
     _friendly_julia_error,
     _julia_worker_command,
+    _normalize_beat_engine_backend,
     _resolve_julia_threads,
     shutdown_beat_engine_workers,
 )
@@ -62,6 +66,48 @@ def test_solver_backend_registry_keeps_legacy_ids_available() -> None:
     assert "beat_cuda" in {info.backend_id for info in available_backend_infos()}
     assert "beat_cpu" in {info.backend_id for info in available_backend_infos()}
     assert "beat_rocm" in {info.backend_id for info in available_backend_infos()}
+
+
+def test_beat_metal_backend_registered() -> None:
+    labels = backend_label_to_id()
+
+    # UI contract: the preferences combo is registry-driven via backend_label_to_id() and
+    # resolves persisted ids through normalize_backend_id (see ui/dialogs.py).
+    assert labels["BEAT Engine (Metal)"] == "beat_metal"
+    assert "beat_metal" in {info.backend_id for info in available_backend_infos()}
+    for alias in ("beat_metal", "metal", "apple", "mps"):
+        assert normalize_backend_id(alias) == "beat_metal", alias
+
+    metal_info = backend_info("beat_metal")
+    assert metal_info.label == "BEAT Engine (Metal)"
+    assert metal_info.capabilities.supports_symmetry is True
+    assert metal_info.capabilities.supports_channel_resynthesis is True
+    assert metal_info.capabilities.is_remote is False
+
+    backend = create_backend("beat_metal")
+    assert isinstance(backend, BeatEngineBackend)
+    assert backend.backend_id == "beat_metal"
+    assert backend.label == "BEAT Engine (Metal)"
+    assert backend.beat_engine_backend == "metal"
+    assert backend.julia_project == DEFAULT_BEAT_ENGINE_METAL_PROJECT
+
+    assert BeatEngineMetalBackend.backend_id == "beat_metal"
+    assert BeatEngineMetalBackend.beat_engine_backend == "metal"
+
+    for alias in ("metal", "apple", "mps", "beat_metal"):
+        assert _normalize_beat_engine_backend(alias) == "metal", alias
+    assert _default_beat_engine_project("metal") == DEFAULT_BEAT_ENGINE_METAL_PROJECT
+
+
+def test_friendly_error_points_metal_users_to_instantiate() -> None:
+    message = _friendly_julia_error(
+        "ERROR: Metal.jl could not be loaded.",
+        julia_project=DEFAULT_BEAT_ENGINE_METAL_PROJECT,
+        beat_engine_backend="metal",
+    )
+    assert "BEAT Engine (Metal)" in message
+    assert "Pkg.instantiate" in message
+    assert "julia_metal" in message
 
 
 def test_local_backend_factory_exposes_contract_metadata() -> None:

@@ -1,6 +1,7 @@
 """Compatibility imports for the BEAT Engine backend."""
 
 from blab.solvers.beat_engine_backend import (
+    DEFAULT_BEAT_ENGINE_METAL_PROJECT,
     DEFAULT_BEAT_ENGINE_PROJECT,
     DEFAULT_BEAT_ENGINE_ROCM_PROJECT,
     DEFAULT_BEAT_ENGINE_SOLVER_SCRIPT,
@@ -9,6 +10,7 @@ from blab.solvers.beat_engine_backend import (
     BeatEngineBackend,
     BeatEngineCpuBackend,
     BeatEngineCudaBackend,
+    BeatEngineMetalBackend,
     BeatEngineRocmBackend,
     BeatEngineSession,
     BeatEngineWorkerProcess,
@@ -21,6 +23,7 @@ from blab.solvers.beat_engine_backend import (
 )
 
 __all__ = [
+    "DEFAULT_BEAT_ENGINE_METAL_PROJECT",
     "DEFAULT_BEAT_ENGINE_PROJECT",
     "DEFAULT_BEAT_ENGINE_ROCM_PROJECT",
     "DEFAULT_BEAT_ENGINE_SOLVER_SCRIPT",
@@ -29,6 +32,7 @@ __all__ = [
     "BeatEngineBackend",
     "BeatEngineCpuBackend",
     "BeatEngineCudaBackend",
+    "BeatEngineMetalBackend",
     "BeatEngineRocmBackend",
     "BeatEngineSession",
     "BeatEngineWorkerProcess",

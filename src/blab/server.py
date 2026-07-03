@@ -33,12 +33,13 @@ from blab.solvers.registry import backend_info, create_backend, normalize_backen
 TERMINAL_STATES = {"completed", "cancelled", "failed"}
 DEFAULT_ARTIFACT_ROOT = Path("runs") / "server_jobs"
 ASSET_FILENAME_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
-SERVER_SOLVER_BACKENDS = {"bempp_cpu", "beat_cpu", "beat_cuda", "beat_rocm"}
+SERVER_SOLVER_BACKENDS = {"bempp_cpu", "beat_cpu", "beat_cuda", "beat_rocm", "beat_metal"}
 SERVER_SOLVER_BACKEND_IDS = {
     "bempp_cpu": "local",
     "beat_cpu": "beat_cpu",
     "beat_cuda": "beat_cuda",
     "beat_rocm": "beat_rocm",
+    "beat_metal": "beat_metal",
 }
 LOGGER = logging.getLogger("blab.server")
 
@@ -608,7 +609,7 @@ def _build_arg_parser(prog: str | None = None) -> argparse.ArgumentParser:
     parser.add_argument(
         "--solver",
         default="bempp_cpu",
-        help="Server-side solver backend: bempp_cpu, beat_cpu, beat_cuda, or beat_rocm.",
+        help="Server-side solver backend: bempp_cpu, beat_cpu, beat_cuda, beat_rocm, or beat_metal.",
     )
     parser.add_argument(
         "--julia-executable",
