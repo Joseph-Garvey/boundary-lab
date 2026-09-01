@@ -26,9 +26,9 @@ frequency-independent cache data on the CPU. The Metal worker then:
 
 1. allocates the single-layer, double-layer, adjoint double-layer, and
    hypersingular matrices as `MtlArray` objects;
-2. evaluates regular Galerkin pairs with pair-owned kernels over
-   element-colored pair blocks, so no two threads in one launch write the
-   same address and the scatter needs no atomics;
+2. evaluates regular Galerkin pairs with one fused kernel, one thread per
+   element pair on a two-dimensional grid, every Green's-function value used
+   for all four operators, scattered with Float32 atomics;
 3. evaluates adjacent and coincident pairs with Duffy singular quadrature and
    gathers their compact correction blocks into the dense operators;
 4. applies symmetry-image contributions and reduced-domain row weights;
@@ -42,12 +42,18 @@ On Apple Silicon the copy from device to host is a memcpy within unified
 memory, and the CPU LU runs through Accelerate-class BLAS. The backend's
 dense-size ceiling is therefore the same as the CPU backend's.
 
-The default regular assembly uses element coloring so pair-owned kernels can
-scatter into the dense operators without atomics, the same design as the ROCm
-backend. An entry-owned kernel, one thread per dense matrix entry, is kept as
-the correctness reference (`BLAB_METAL_REGULAR_KERNEL_MODE=entry_owned`); it
-does roughly nine times the Green's-function work because each element pair
-is revisited by every entry it contributes to. Both are deterministic.
+Three regular-assembly kernels exist. The default, `pair_atomic`, is the
+fused atomic kernel described above; it uses the fast-math AIR intrinsics
+(`air.fast_sin`, `air.fast_cos`, `air.fast_rsqrt`), the same arithmetic an
+Xcode-compiled Metal shader gets by default, 32-bit indices, and trial
+quadrature points hoisted out of the point-pair loop. Its singular
+corrections are scattered per pair with atomics too. `pair_owned` is the
+ROCm backend's colored pair-owned design, deterministic because no two pairs
+in one launch share a matrix entry; `entry_owned`, one thread per dense
+matrix entry, is the correctness reference and does roughly nine times the
+Green's-function work. On an M1 Max at 5k P1 dofs and quadrature order 4
+they take 3.7 s, 6.8 s, and about 25 s per frequency; all three agree with
+BEAT CPU to the same tolerances.
 
 ## Requirements
 
@@ -80,7 +86,7 @@ Normal application use does not require these environment variables.
 | Variable | Default | Purpose |
 |---|---|---|
 | `BLAB_METAL_ASSEMBLY_MODE` | `native` | Use `host_staged` to assemble operators on the CPU and upload them as a diagnostic fallback. |
-| `BLAB_METAL_REGULAR_KERNEL_MODE` | `pair_owned` | Use `entry_owned` as an alternate regular-assembly correctness reference. |
+| `BLAB_METAL_REGULAR_KERNEL_MODE` | `pair_atomic` | Use `pair_owned` for the deterministic colored kernels or `entry_owned` as the correctness reference. |
 | `BLAB_METAL_SINGULAR_MODE` | `native` | Use `host` to compute the Duffy singular corrections on the CPU and add them to the device operators, separating kernel defects from rule defects. |
 | `BLAB_METAL_KERNEL_GROUPSIZE` | `256` | Threads per threadgroup for the assembly kernels. |
 
@@ -111,5 +117,7 @@ CPU-versus-Metal differences exceed their tolerances.
   solve time should be evaluated after warm-up.
 - Frequency-independent caches remain resident for the worker's lifetime and are
   released when the worker exits.
-- Both kernel modes are deterministic: repeated assemblies of the same
-  operator are bitwise identical, because no kernel uses atomic accumulation.
+- The default `pair_atomic` kernels are not bitwise reproducible run to run
+  (atomic accumulation order); the differences are float32 summation noise.
+  `pair_owned` and `entry_owned` are deterministic. Golden-file comparisons
+  belong on those, tolerance comparisons on the default.

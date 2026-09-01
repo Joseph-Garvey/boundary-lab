@@ -74,7 +74,7 @@ function _metal_kernel_groupsize()
 end
 
 function _normalized_metal_regular_kernel_mode(value=nothing)
-    value === nothing && (value = get(ENV, "BLAB_METAL_REGULAR_KERNEL_MODE", "pair_owned"))
+    value === nothing && (value = get(ENV, "BLAB_METAL_REGULAR_KERNEL_MODE", "pair_atomic"))
     mode = Symbol(lowercase(strip(String(value))))
     aliases = Dict(
         :pair => :pair_owned,
@@ -83,10 +83,13 @@ function _normalized_metal_regular_kernel_mode(value=nothing)
         :colored_pair_owned => :pair_owned,
         :entry => :entry_owned,
         :entry_owned => :entry_owned,
+        :atomic => :pair_atomic,
+        :pair_atomic => :pair_atomic,
+        :fused_atomic => :pair_atomic,
     )
     normalized = get(aliases, mode, nothing)
     normalized === nothing && error(
-        "BLAB_METAL_REGULAR_KERNEL_MODE must be pair_owned or entry_owned; got $(value).",
+        "BLAB_METAL_REGULAR_KERNEL_MODE must be pair_owned, pair_atomic, or entry_owned; got $(value).",
     )
     return normalized
 end

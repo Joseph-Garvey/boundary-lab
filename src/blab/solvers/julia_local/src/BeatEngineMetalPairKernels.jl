@@ -78,7 +78,7 @@ function _metal_regular_slp_adjoint_dlp_pairs_kernel!(
         skip_mode,
     ) && return nothing
 
-    four_pi = typeof(k)(12.566370614359172)
+    inv_four_pi = typeof(k)(0.07957747154594767)
     slp_re = zero(SVector{3,typeof(k)})
     slp_im = zero(SVector{3,typeof(k)})
     adj_re = zero(SVector{3,typeof(k)})
@@ -118,13 +118,14 @@ function _metal_regular_slp_adjoint_dlp_pairs_kernel!(
             dx = sx - x
             dy = sy - y
             dz = sz - z
-            radius = sqrt(dx * dx + dy * dy + dz * dz)
-            if radius > zero(k)
-                inv_radius = one(k) / radius
+            radius2 = dx * dx + dy * dy + dz * dz
+            if radius2 > zero(k)
+                inv_radius = _metal_fast_rsqrt(radius2)
+                radius = radius2 * inv_radius
                 phase = k * radius
-                green_scale = inv_radius / four_pi
-                green_re = cos(phase) * green_scale
-                green_im = sin(phase) * green_scale
+                green_scale = inv_radius * inv_four_pi
+                green_re = _metal_fast_cos(phase) * green_scale
+                green_im = _metal_fast_sin(phase) * green_scale
                 weight = test_weight * rule_weights[trial_q] * jac_scale
                 weighted_basis = test_basis * weight
                 slp_re += weighted_basis * green_re
@@ -263,7 +264,7 @@ function _metal_regular_hyp_pairs_kernel!(
         skip_mode,
     ) && return nothing
 
-    four_pi = typeof(k)(12.566370614359172)
+    inv_four_pi = typeof(k)(0.07957747154594767)
     k2 = k * k
     hyp_re = zero(SVector{9,typeof(k)})
     hyp_im = zero(SVector{9,typeof(k)})
@@ -308,13 +309,14 @@ function _metal_regular_hyp_pairs_kernel!(
             dx = sx - x
             dy = sy - y
             dz = sz - z
-            radius = sqrt(dx * dx + dy * dy + dz * dz)
-            if radius > zero(k)
-                inv_radius = one(k) / radius
+            radius2 = dx * dx + dy * dy + dz * dz
+            if radius2 > zero(k)
+                inv_radius = _metal_fast_rsqrt(radius2)
+                radius = radius2 * inv_radius
                 phase = k * radius
-                green_scale = inv_radius / four_pi
-                green_re = cos(phase) * green_scale
-                green_im = sin(phase) * green_scale
+                green_scale = inv_radius * inv_four_pi
+                green_re = _metal_fast_cos(phase) * green_scale
+                green_im = _metal_fast_sin(phase) * green_scale
                 weight = test_weight * rule_weights[trial_q] * jac_scale
                 basis_products = SVector(
                     tb1 * rb1, tb2 * rb1, tb3 * rb1,
