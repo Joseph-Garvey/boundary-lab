@@ -12,6 +12,7 @@ import numpy as np
 
 from blab.solvers.beat_engine_backend import (
     DEFAULT_BEAT_ENGINE_CUDA_PROJECT,
+    DEFAULT_BEAT_ENGINE_METAL_PROJECT,
     DEFAULT_BEAT_ENGINE_ROCM_PROJECT,
     _get_julia_worker,
 )
@@ -46,12 +47,13 @@ def evaluate_bem_field(
 
     normalized_backend = normalize_backend_id(backend_id)
     if not supports_physical_system_solves(normalized_backend):
-        raise ValueError("Retained BEM fields require a BEAT Engine CPU, CUDA, or ROCm backend.")
+        raise ValueError("Retained BEM fields require a BEAT Engine CPU, CUDA, ROCm, or Metal backend.")
     bem_backend = _bem_backend_for_id(normalized_backend)
     julia_project = {
         "cpu": DEFAULT_COUPLED_CPU_PROJECT,
         "cuda": DEFAULT_BEAT_ENGINE_CUDA_PROJECT,
         "rocm": DEFAULT_BEAT_ENGINE_ROCM_PROJECT,
+        "metal": DEFAULT_BEAT_ENGINE_METAL_PROJECT,
     }[bem_backend]
     worker = _get_julia_worker(
         julia_executable=julia_executable,

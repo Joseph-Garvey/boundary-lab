@@ -8,12 +8,11 @@ assembly and exterior-field evaluation to the GPU through Metal.jl.
 The backend supports:
 
 - exterior Burton-Miller BEM solves;
+- coupled FEM-BEM-LEM physical-system solves;
 - `off`, `x`, and `xy` symmetry;
 - GPU-resident regular and singular operator assembly;
 - GPU exterior-field evaluation for polar, spherical, and arbitrary observation
   points.
-
-Coupled FEM-BEM-LEM physical-system solves are not yet routed to this backend.
 
 Production solves use `Float32` and `ComplexF32`, which is also the only
 floating-point precision Apple GPUs provide. See [BEAT Engine
@@ -36,6 +35,16 @@ frequency-independent cache data on the CPU. The Metal worker then:
    system, and factors it once per frequency with LAPACK on the CPU, reusing
    that factorization across every channel drive; and
 6. evaluates the exterior field with Metal kernels.
+
+### Coupled FEM-BEM-LEM
+
+Coupled solves take the CPU backend's shape with the BEM stage moved to the
+GPU: sparse FEM assembly and the UMFPACK interior Schur complement run on the
+CPU, the four BEM operators are assembled on Metal and copied to the host,
+and the retained coupled system is factored with the CPU dense LU. The
+condensed formulation is the default, exactly as for the CPU backend, and the
+monolithic formulation remains available for validation. Interior-FEM-only
+solves have no BEM stage and run on the CPU path unchanged.
 
 The dense factorization stays on the CPU because Metal.jl provides no GPU LU.
 On Apple Silicon the copy from device to host is a memcpy within unified
@@ -98,6 +107,7 @@ CPU-versus-Metal validation scripts:
 |---|---|
 | `validate_metal_exterior.jl` | Operators (both singular modes), boundary pressure, residual, and exterior field for an exterior solve. |
 | `validate_metal_symmetry.jl` | X and XY reduced-domain assembly and solve parity, both singular modes. |
+| `validate_metal_coupled.jl` | Coupled FEM-BEM-LEM assembly, condensation, solution, and field for the monolithic and condensed paths, prescribed-velocity and voltage excitations. |
 
 For example:
 

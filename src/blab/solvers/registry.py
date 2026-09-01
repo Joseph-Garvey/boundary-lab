@@ -101,9 +101,9 @@ _BACKENDS: dict[str, SolverBackendInfo] = {
 
 
 #: Backends that can run compiled physical-system (exterior and coupled FEM-BEM) solves.
-PHYSICAL_SYSTEM_BACKEND_IDS = frozenset({"beat_cpu", "beat_cuda", "beat_rocm"})
+PHYSICAL_SYSTEM_BACKEND_IDS = frozenset({"beat_cpu", "beat_cuda", "beat_rocm", "beat_metal"})
 #: Backends that condense the FEM interior onto the retained interface for coupled solves.
-CONDENSING_BACKEND_IDS = frozenset({"beat_cpu", "beat_cuda", "beat_rocm"})
+CONDENSING_BACKEND_IDS = frozenset({"beat_cpu", "beat_cuda", "beat_rocm", "beat_metal"})
 
 
 def supports_physical_system_solves(backend_id: str) -> bool:

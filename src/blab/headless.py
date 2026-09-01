@@ -61,6 +61,7 @@ HEADLESS_BACKEND_IDS = (
     "beat_cpu",
     "beat_cuda",
     "beat_rocm",
+    "beat_metal",
 )
 
 

@@ -26,6 +26,7 @@ from blab.physical_model import (
 )
 from blab.solvers.beat_engine_backend import (
     DEFAULT_BEAT_ENGINE_CUDA_PROJECT,
+    DEFAULT_BEAT_ENGINE_METAL_PROJECT,
     DEFAULT_BEAT_ENGINE_ROCM_PROJECT,
     BeatEngineWorkerProcess,
     _get_julia_worker,
@@ -42,7 +43,7 @@ from blab.system_contract import (
 
 DEFAULT_COUPLED_SOLVER_SCRIPT = Path(__file__).with_name("julia_local") / "coupled_solver.jl"
 DEFAULT_COUPLED_CPU_PROJECT = DEFAULT_COUPLED_SOLVER_SCRIPT.parent
-COUPLED_BEM_BACKENDS = {"cpu", "cuda", "rocm"}
+COUPLED_BEM_BACKENDS = {"cpu", "cuda", "rocm", "metal"}
 COUPLED_BOUNDARY_KINDS = {
     BoundaryKind.RIGID,
     BoundaryKind.MOVING,
@@ -275,7 +276,7 @@ class _CoupledBackend:
             raise ValueError("Coupled precision must be float32 or float64.")
         normalized_bem_backend = str(bem_backend).strip().lower()
         if normalized_bem_backend not in COUPLED_BEM_BACKENDS:
-            raise ValueError("Coupled BEM backend must be cpu, cuda, or rocm.")
+            raise ValueError("Coupled BEM backend must be cpu, cuda, rocm, or metal.")
         self.julia_executable = julia_executable
         self.solver_script = Path(solver_script)
         self.julia_project = None if julia_project is None else Path(julia_project)
@@ -942,6 +943,7 @@ class PhysicalSystemProductionBackend(_CoupledBackend):
             "cpu": DEFAULT_COUPLED_CPU_PROJECT,
             "cuda": DEFAULT_BEAT_ENGINE_CUDA_PROJECT,
             "rocm": DEFAULT_BEAT_ENGINE_ROCM_PROJECT,
+            "metal": DEFAULT_BEAT_ENGINE_METAL_PROJECT,
         }.get(normalized_bem_backend, DEFAULT_COUPLED_CPU_PROJECT)
         super().__init__(
             julia_executable=julia_executable,
