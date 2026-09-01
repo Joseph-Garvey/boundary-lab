@@ -348,18 +348,27 @@ function _condensed_quadrature_bundle(
     order::Int;
     singular_order::Int,
     symmetry_mode::Symbol,
+    bem_backend::Symbol=:cpu,
 ) where {T<:AbstractFloat}
     rule = triangle_rule(T, order)
 
     assembly_started = time_ns()
-    cpu_assembly_cache = build_beat_cpu_assembly_cache(
+    cpu_assembly_cache = bem_backend == :cpu ? build_beat_cpu_assembly_cache(
         bem_mesh,
         p1,
         dp0,
         rule;
         singular_order=singular_order,
         symmetry_mode=symmetry_mode,
-    )
+    ) : nothing
+    device_cache = bem_backend == :metal ? build_metal_regular_assembly_cache(
+        bem_mesh,
+        p1,
+        dp0,
+        rule;
+        singular_order=singular_order,
+        symmetry_mode=symmetry_mode,
+    ) : nothing
     bem_cpu_assembly_cache_s = (time_ns() - assembly_started) / 1.0e9
 
     identity_started = time_ns()
@@ -379,13 +388,16 @@ function _condensed_quadrature_bundle(
     bem_identity_cache_s = (time_ns() - identity_started) / 1.0e9
 
     field_started = time_ns()
-    field_cache = build_field_evaluation_cache(bem_mesh, rule; symmetry_mode=symmetry_mode)
+    cpu_field_cache = build_field_evaluation_cache(bem_mesh, rule; symmetry_mode=symmetry_mode)
+    field_cache = bem_backend == :metal ?
+                  build_metal_field_evaluation_cache(cpu_field_cache) : cpu_field_cache
     field_cache_s = (time_ns() - field_started) / 1.0e9
 
     return (
         order=order,
         rule=rule,
         cpu_assembly_cache=cpu_assembly_cache,
+        device_cache=device_cache,
         identity_p1_p1=identity_p1_p1,
         identity_p1_dp0=identity_p1_dp0,
         field_cache=field_cache,
@@ -419,14 +431,19 @@ function prepare_condensed_coupled_cache(
     retained_fem_vertices=interface_map.fem_vertex_indices,
     bulk_loss_factor_by_vertex=zeros(T, length(fem_mesh.vertices)),
     wall_impedances=NamedTuple[],
+    bem_backend::Symbol=:cpu,
 ) where {T<:AbstractFloat}
+    # The condensed solver's linear algebra is CPU-only; the BEM operators may
+    # come from the CPU or from Metal, which hands them back as host matrices.
+    bem_backend in (:cpu, :metal) ||
+        error("Condensed coupled BEM backend must be :cpu or :metal; got $bem_backend.")
     base = prepare_coupled_cache(
         fem_mesh,
         bem_mesh,
         interface_map;
         quadrature_order=quadrature_order,
         singular_order=singular_order,
-        bem_backend=:cpu,
+        bem_backend=bem_backend,
         symmetry_mode=symmetry_mode,
         retained_fem_vertices=retained_fem_vertices,
         bulk_loss_factor_by_vertex=bulk_loss_factor_by_vertex,
@@ -449,6 +466,7 @@ function prepare_condensed_coupled_cache(
         order=quadrature_order,
         rule=base.rule,
         cpu_assembly_cache=base.cpu_assembly_cache,
+        device_cache=base.device_cache,
         identity_p1_p1=base.identity_p1_p1,
         identity_p1_dp0=base.identity_p1_dp0,
         field_cache=base.field_cache,
@@ -462,6 +480,7 @@ function prepare_condensed_coupled_cache(
             order;
             singular_order=singular_order,
             symmetry_mode=base.symmetry_mode,
+            bem_backend=bem_backend,
         )
     end
     # Extra bundles are real setup cost, so fold them into the fields the caller already reports
@@ -489,8 +508,16 @@ function prepare_condensed_coupled_cache(
 end
 
 function release_condensed_coupled_cache!(cache)
-    # CPU only, so the bundles hold host memory that the collector reclaims; the base cache still
-    # owns whatever `prepare_coupled_cache` allocated.
+    # Extra bundles (orders other than the base) own their own device caches
+    # under Metal; host bundles are reclaimed by the collector. The base cache
+    # still owns whatever `prepare_coupled_cache` allocated.
+    if cache.base.bem_backend == :metal
+        for (order, bundle) in cache.quadrature_bundles
+            order == cache.base_quadrature_order && continue
+            release_metal_regular_assembly_cache!(bundle.device_cache)
+            release_metal_field_evaluation_cache!(bundle.field_cache)
+        end
+    end
     release_coupled_cache!(cache.base)
     return nothing
 end
@@ -579,8 +606,8 @@ function build_condensed_coupled_system(
     # The selected bundle's fields shadow the base cache's, so everything below reads the cache
     # exactly as it did before per-order quadrature existed.
     prepared = merge(condensed_cache.base, bundle)
-    prepared.bem_backend == :cpu ||
-        error("Condensed coupled cache must be built for the CPU BEM backend.")
+    prepared.bem_backend in (:cpu, :metal) ||
+        error("Condensed coupled cache must be built for the CPU or Metal BEM backend.")
     prepared.symmetry_mode == BeatEngineCore.normalized_symmetry_mode(symmetry_mode) ||
         error("Coupled cache symmetry mode does not match requested symmetry.")
     prepared.retained_fem_vertices == retained_fem_vertices ||
@@ -630,18 +657,40 @@ function build_condensed_coupled_system(
     # This solver's own fork of the CPU regular assembly, so it can be optimised without
     # touching the shared path every other backend runs through. Behaviourally identical to
     # `assemble_regular_galerkin_operators(...; backend=:cpu)`, pinned by an equivalence test.
-    operators = assemble_condensed_regular_operators(
-        bem_mesh,
-        prepared.p1,
-        prepared.dp0,
-        wavenumber,
-        prepared.rule;
-        skip_singular=false,
-        singular_order=singular_order,
-        singular_cache=prepared.singular_cache,
-        cpu_cache=prepared.cpu_assembly_cache,
-        symmetry_mode=prepared.symmetry_mode,
-    )
+    operators = if prepared.bem_backend == :metal
+        # Metal assembles the four operators on the GPU; the condensed algebra
+        # below is CPU-only, so bring them down and free the device copies.
+        device_operators = assemble_regular_galerkin_operators(
+            bem_mesh,
+            prepared.p1,
+            prepared.dp0,
+            wavenumber,
+            prepared.rule;
+            skip_singular=false,
+            singular_order=singular_order,
+            backend=:metal,
+            device_cache=prepared.device_cache,
+            singular_cache=prepared.singular_cache,
+            device_singular_cache=prepared.device_singular_cache,
+            symmetry_mode=prepared.symmetry_mode,
+        )
+        host_operators = metal_host_operators(device_operators)
+        release_operator_storage!(device_operators)
+        host_operators
+    else
+        assemble_condensed_regular_operators(
+            bem_mesh,
+            prepared.p1,
+            prepared.dp0,
+            wavenumber,
+            prepared.rule;
+            skip_singular=false,
+            singular_order=singular_order,
+            singular_cache=prepared.singular_cache,
+            cpu_cache=prepared.cpu_assembly_cache,
+            symmetry_mode=prepared.symmetry_mode,
+        )
+    end
     bem_operator_s = (time_ns() - bem_operator_started) / 1.0e9
 
     bem_matrix_started = time_ns()
@@ -765,7 +814,7 @@ function build_condensed_coupled_system(
         bem_rhs_operator=nothing,
         prescribed_bem_rhs=bem_prescribed_rhs,
         prescribed_bem_neumann=bem_prescribed_neumann,
-        bem_backend=:cpu,
+        bem_backend=prepared.bem_backend,
         linear_backend=:cpu,
         symmetry_mode=prepared.symmetry_mode,
         cache=condensed_cache,

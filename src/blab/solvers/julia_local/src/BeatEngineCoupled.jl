@@ -1054,8 +1054,8 @@ function prepare_coupled_cache(
     is_quadratic(fem_mesh) && error(
         "Quadratic tetrahedra are currently supported only by the pure interior FEM solve.",
     )
-    bem_backend in (:cpu, :cuda, :rocm) ||
-        error("Unsupported coupled BEM backend: $bem_backend. Expected :cpu, :cuda, or :rocm.")
+    bem_backend in (:cpu, :cuda, :rocm, :metal) ||
+        error("Unsupported coupled BEM backend: $bem_backend. Expected :cpu, :cuda, :rocm, or :metal.")
     normalized_symmetry = BeatEngineCore.normalized_symmetry_mode(symmetry_mode)
     validate_symmetry_fundamental_domain!(bem_mesh, normalized_symmetry)
 
@@ -1123,11 +1123,24 @@ function prepare_coupled_cache(
             singular_order=singular_order,
             symmetry_mode=normalized_symmetry,
         )
+    elseif bem_backend == :metal
+        # Metal assembles the BEM operators on the GPU and hands them to the CPU
+        # coupled algebra, so only the assembly, singular, and field caches live
+        # on the device; identity blocks and sparse FEM blocks stay on the host.
+        build_metal_regular_assembly_cache(
+            bem_mesh,
+            p1,
+            dp0,
+            rule;
+            singular_order=singular_order,
+            symmetry_mode=normalized_symmetry,
+        )
     else
         nothing
     end
     bem_backend == :cuda && BeatEngineCore.cuda_module().synchronize()
     bem_backend == :rocm && BeatEngineCore.amdgpu_module().synchronize()
+    bem_backend == :metal && BeatEngineCore.metal_module().synchronize()
     bem_device_regular_cache_s = (time_ns() - device_regular_started) / 1.0e9
 
     device_singular_started = time_ns()
@@ -1135,11 +1148,14 @@ function prepare_coupled_cache(
         BeatEngineCore.build_cuda_singular_correction_cache(singular_cache, p1, dp0)
     elseif bem_backend == :rocm
         build_rocm_singular_correction_cache(singular_cache)
+    elseif bem_backend == :metal
+        build_metal_singular_correction_cache(singular_cache)
     else
         nothing
     end
     bem_backend == :cuda && BeatEngineCore.cuda_module().synchronize()
     bem_backend == :rocm && BeatEngineCore.amdgpu_module().synchronize()
+    bem_backend == :metal && BeatEngineCore.metal_module().synchronize()
     bem_device_singular_cache_s = (time_ns() - device_singular_started) / 1.0e9
 
     device_image_started = time_ns()
@@ -1237,11 +1253,14 @@ function prepare_coupled_cache(
         build_cuda_field_evaluation_cache(cpu_field_cache)
     elseif bem_backend == :rocm
         build_rocm_field_evaluation_cache(cpu_field_cache)
+    elseif bem_backend == :metal
+        build_metal_field_evaluation_cache(cpu_field_cache)
     else
         cpu_field_cache
     end
     bem_backend == :cuda && BeatEngineCore.cuda_module().synchronize()
     bem_backend == :rocm && BeatEngineCore.amdgpu_module().synchronize()
+    bem_backend == :metal && BeatEngineCore.metal_module().synchronize()
     field_cache_s = (time_ns() - field_started) / 1.0e9
 
     return (
@@ -1294,6 +1313,12 @@ function _unsafe_free_cuda_fields!(value, fields)
 end
 
 function release_coupled_cache!(cache)
+    if cache.bem_backend == :metal
+        release_metal_regular_assembly_cache!(cache.device_cache)
+        release_metal_singular_correction_cache!(cache.device_singular_cache)
+        release_metal_field_evaluation_cache!(cache.field_cache)
+        return nothing
+    end
     if cache.bem_backend == :rocm
         release_rocm_regular_assembly_cache!(cache.device_cache)
         release_rocm_singular_correction_cache!(cache.device_singular_cache)
@@ -1915,10 +1940,17 @@ function build_coupled_system(
         device_cache=prepared.device_cache,
         device_image_singular_cache=prepared.device_image_singular_cache,
         symmetry_mode=prepared.symmetry_mode,
-        return_device=bem_backend in (:cuda, :rocm),
-        accelerator_quadrature=bem_backend in (:cuda, :rocm),
+        return_device=bem_backend in (:cuda, :rocm, :metal),
+        accelerator_quadrature=bem_backend in (:cuda, :rocm, :metal),
         device_singular_cache=prepared.device_singular_cache,
     )
+    if bem_backend == :metal
+        # The coupled algebra below runs on the CPU for Metal (no GPU LU), so
+        # bring the four operators down once and free the device copies.
+        host_operators = metal_host_operators(operators)
+        release_operator_storage!(operators)
+        operators = host_operators
+    end
     bem_operator_s = (time_ns() - bem_operator_started) / 1.0e9
     bem_matrix_started = time_ns()
     linear_backend = bem_backend in (:cuda, :rocm) && !validation_diagnostics ?
