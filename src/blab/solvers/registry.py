@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import platform
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -68,6 +69,22 @@ _BACKENDS: dict[str, SolverBackendInfo] = {
         ),
         factory=lambda **kwargs: _create_beat_engine_backend(beat_engine_backend="rocm", **kwargs),
         description="Run the local Boundary Element Acoustic Toolkit Engine ROCm solver through the Boundary Lab subprocess adapter.",
+    ),
+    "beat_metal": SolverBackendInfo(
+        backend_id="beat_metal",
+        label="BEAT Engine (Apple Metal)",
+        capabilities=SolverCapabilities(
+            supports_remote_assets=False,
+            supports_parallel_workers=False,
+            supports_symmetry=True,
+            supports_channel_resynthesis=True,
+            is_remote=False,
+        ),
+        factory=lambda **kwargs: _create_beat_engine_backend(beat_engine_backend="metal", **kwargs),
+        # Apple GPUs only; the Julia environment is julia_metal. Hidden on
+        # every other platform so the preferences list does not offer it.
+        available=platform.system() == "Darwin" and platform.machine() == "arm64",
+        description="Run the local Boundary Element Acoustic Toolkit Engine Apple Metal solver through the Boundary Lab subprocess adapter.",
     ),
     "local": SolverBackendInfo(
         backend_id="local",
@@ -146,6 +163,10 @@ def normalize_backend_id(backend_id: str) -> str:
         "rocm": "beat_rocm",
         "amd": "beat_rocm",
         "amdgpu": "beat_rocm",
+        "beat_metal": "beat_metal",
+        "metal": "beat_metal",
+        "apple": "beat_metal",
+        "mps": "beat_metal",
     }
     return aliases.get(text, text or "local")
 
@@ -196,6 +217,7 @@ def _create_beat_engine_backend(
     from blab.solvers.beat_engine_backend import (
         DEFAULT_BEAT_ENGINE_CPU_PROJECT,
         DEFAULT_BEAT_ENGINE_CUDA_PROJECT,
+        DEFAULT_BEAT_ENGINE_METAL_PROJECT,
         DEFAULT_BEAT_ENGINE_ROCM_PROJECT,
         BeatEngineBackend,
     )
@@ -204,6 +226,8 @@ def _create_beat_engine_backend(
         "cpu": "cpu",
         "rocm": "rocm",
         "beat_rocm": "rocm",
+        "metal": "metal",
+        "beat_metal": "metal",
     }.get(str(beat_engine_backend).strip().lower(), "cuda")
     backend_id = backend_id_override or f"beat_{normalized_backend}"
     label = (
@@ -212,12 +236,14 @@ def _create_beat_engine_backend(
             "cpu": "BEAT Engine (CPU)",
             "cuda": "BEAT Engine (Nvidia CUDA)",
             "rocm": "BEAT Engine (AMD ROCm)",
+            "metal": "BEAT Engine (Apple Metal)",
         }[normalized_backend]
     )
     default_project = {
         "cpu": DEFAULT_BEAT_ENGINE_CPU_PROJECT,
         "cuda": DEFAULT_BEAT_ENGINE_CUDA_PROJECT,
         "rocm": DEFAULT_BEAT_ENGINE_ROCM_PROJECT,
+        "metal": DEFAULT_BEAT_ENGINE_METAL_PROJECT,
     }[normalized_backend]
     kwargs: dict[str, Any] = {
         "julia_executable": julia_executable,

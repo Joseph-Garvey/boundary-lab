@@ -29,6 +29,7 @@ DEFAULT_BEAT_ENGINE_SOLVER_SCRIPT = Path(__file__).with_name("julia_local") / "s
 DEFAULT_BEAT_ENGINE_CPU_PROJECT = DEFAULT_BEAT_ENGINE_SOLVER_SCRIPT.parent
 DEFAULT_BEAT_ENGINE_CUDA_PROJECT = Path(__file__).with_name("julia_cuda")
 DEFAULT_BEAT_ENGINE_ROCM_PROJECT = Path(__file__).with_name("julia_rocm")
+DEFAULT_BEAT_ENGINE_METAL_PROJECT = Path(__file__).with_name("julia_metal")
 DEFAULT_BEAT_ENGINE_PROJECT = DEFAULT_BEAT_ENGINE_CPU_PROJECT
 _DEFAULT_BEAT_ENGINE_PROJECT_SENTINEL = "__default__"
 _WORKERS_LOCK = threading.Lock()
@@ -38,10 +39,12 @@ _WORKERS: dict[tuple[str, str, str, str], "BeatEngineWorkerProcess"] = {}
 BEAT_ENGINE_CUDA_BACKEND = "cuda"
 BEAT_ENGINE_CPU_BACKEND = "cpu"
 BEAT_ENGINE_ROCM_BACKEND = "rocm"
+BEAT_ENGINE_METAL_BACKEND = "metal"
 BEAT_ENGINE_BACKENDS = {
     BEAT_ENGINE_CUDA_BACKEND,
     BEAT_ENGINE_CPU_BACKEND,
     BEAT_ENGINE_ROCM_BACKEND,
+    BEAT_ENGINE_METAL_BACKEND,
 }
 
 
@@ -592,6 +595,19 @@ class BeatEngineRocmBackend(BeatEngineBackend):
     )
 
 
+class BeatEngineMetalBackend(BeatEngineBackend):
+    backend_id = "beat_metal"
+    label = "BEAT Engine (Apple Metal)"
+    beat_engine_backend = BEAT_ENGINE_METAL_BACKEND
+    capabilities = SolverCapabilities(
+        supports_remote_assets=False,
+        supports_parallel_workers=False,
+        supports_symmetry=True,
+        supports_channel_resynthesis=True,
+        is_remote=False,
+    )
+
+
 def _normalize_warmup_mode(value: object) -> str:
     text = str(value or "off").strip().lower()
     aliases = {
@@ -675,6 +691,10 @@ def _normalize_beat_engine_backend(value: object) -> str:
         "rocm": BEAT_ENGINE_ROCM_BACKEND,
         "amd": BEAT_ENGINE_ROCM_BACKEND,
         "amdgpu": BEAT_ENGINE_ROCM_BACKEND,
+        "beat_metal": BEAT_ENGINE_METAL_BACKEND,
+        "metal": BEAT_ENGINE_METAL_BACKEND,
+        "apple": BEAT_ENGINE_METAL_BACKEND,
+        "mps": BEAT_ENGINE_METAL_BACKEND,
     }
     backend = aliases.get(text, text)
     if backend not in BEAT_ENGINE_BACKENDS:
@@ -687,6 +707,8 @@ def _default_beat_engine_project(beat_engine_backend: str) -> Path:
         return DEFAULT_BEAT_ENGINE_CPU_PROJECT
     if beat_engine_backend == BEAT_ENGINE_ROCM_BACKEND:
         return DEFAULT_BEAT_ENGINE_ROCM_PROJECT
+    if beat_engine_backend == BEAT_ENGINE_METAL_BACKEND:
+        return DEFAULT_BEAT_ENGINE_METAL_PROJECT
     return DEFAULT_BEAT_ENGINE_CUDA_PROJECT
 
 
@@ -725,12 +747,24 @@ def _friendly_julia_error(
         "using amdgpu",
         "import amdgpu",
     )
+    metal_load_markers = (
+        "metal.jl could not be loaded",
+        "metal.jl is not loaded",
+        "package metal",
+        "using metal",
+        "import metal",
+    )
     looks_like_dependency_error = any(marker in text for marker in missing_dependency_markers)
     looks_like_julia_load_error = any(marker in text for marker in julia_load_markers)
     looks_like_cuda_error = any(marker in text for marker in cuda_load_markers)
     looks_like_rocm_error = any(marker in text for marker in rocm_load_markers)
+    looks_like_metal_error = any(marker in text for marker in metal_load_markers)
     if not (
-        looks_like_dependency_error or looks_like_julia_load_error or looks_like_cuda_error or looks_like_rocm_error
+        looks_like_dependency_error
+        or looks_like_julia_load_error
+        or looks_like_cuda_error
+        or looks_like_rocm_error
+        or looks_like_metal_error
     ):
         return message
 
@@ -753,6 +787,8 @@ def _julia_project_backend_label(project_path: Path, beat_engine_backend: str | 
         return "BEAT Engine (CPU)"
     if beat_engine_backend == BEAT_ENGINE_ROCM_BACKEND or project_path == DEFAULT_BEAT_ENGINE_ROCM_PROJECT:
         return "BEAT Engine (AMD ROCm)"
+    if beat_engine_backend == BEAT_ENGINE_METAL_BACKEND or project_path == DEFAULT_BEAT_ENGINE_METAL_PROJECT:
+        return "BEAT Engine (Apple Metal)"
     return "the selected BEAT Engine backend"
 
 
@@ -813,6 +849,13 @@ def _julia_process_env(
             is_cuda_project = False
         if is_cuda_project:
             env["BLAB_BEAT_ENGINE_GPU_BACKEND"] = BEAT_ENGINE_CUDA_BACKEND
+    if julia_project is not None:
+        try:
+            is_metal_project = Path(julia_project).resolve() == DEFAULT_BEAT_ENGINE_METAL_PROJECT.resolve()
+        except OSError:
+            is_metal_project = False
+        if is_metal_project:
+            env["BLAB_BEAT_ENGINE_GPU_BACKEND"] = BEAT_ENGINE_METAL_BACKEND
     return env
 
 
