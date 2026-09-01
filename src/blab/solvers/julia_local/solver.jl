@@ -84,9 +84,12 @@ function beat_backend_from_request(request)
         "beat_rocm" => "rocm",
         "amd" => "rocm",
         "amdgpu" => "rocm",
+        "beat_metal" => "metal",
+        "apple" => "metal",
+        "mps" => "metal",
     )
     backend = get(aliases, backend, backend)
-    backend in ("cuda", "cpu", "rocm") || error("Unsupported BEAT Engine backend: $(backend). Expected cuda, cpu, or rocm.")
+    backend in ("cuda", "cpu", "rocm", "metal") || error("Unsupported BEAT Engine backend: $(backend). Expected cuda, cpu, rocm, or metal.")
     return Symbol(backend)
 end
 
@@ -476,6 +479,8 @@ function field_for_points(points, mesh, pressure, q_neumann, k, field_cache, bea
         return evaluate_galerkin_field_cuda(points, mesh, pressure, q_neumann, k, field_cache)
     elseif beat_backend == :rocm
         return evaluate_galerkin_field_rocm(points, mesh, pressure, q_neumann, k, field_cache)
+    elseif beat_backend == :metal
+        return evaluate_galerkin_field_metal(points, mesh, pressure, q_neumann, k, field_cache)
     elseif beat_backend == :cpu
         return evaluate_galerkin_field_cpu(points, mesh, pressure, q_neumann, k, field_cache)
     end
@@ -654,6 +659,7 @@ end
 function cleanup_accelerators_after_solve!()
     cuda = BeatEngineCore.CUDA_MODULE
     rocm = BeatEngineCore.AMDGPU_MODULE
+    metal = BeatEngineCore.METAL_MODULE
     if cuda !== nothing
         try
             cuda.functional() && cuda.synchronize()
@@ -663,6 +669,12 @@ function cleanup_accelerators_after_solve!()
     if rocm !== nothing
         try
             rocm.functional() && rocm.synchronize()
+        catch
+        end
+    end
+    if metal !== nothing
+        try
+            metal.functional() && metal.synchronize()
         catch
         end
     end
@@ -699,6 +711,9 @@ function solve_request_impl(request)
     beat_backend = beat_backend_from_request(request)
     rocm_assembly_mode = beat_backend == :rocm ? BeatEngineCore._normalized_rocm_assembly_mode(
         get_value(config, "rocm_assembly_mode", nothing),
+    ) : nothing
+    metal_assembly_mode = beat_backend == :metal ? BeatEngineCore._normalized_metal_assembly_mode(
+        get_value(config, "metal_assembly_mode", nothing),
     ) : nothing
     frequencies = Float32.(request["frequencies_hz"])
     isempty(frequencies) && error("frequencies_hz must contain at least one frequency.")
@@ -803,6 +818,26 @@ function solve_request_impl(request)
             identity_p1_dp0,
             FloatType,
         )
+    elseif beat_backend == :metal
+        emit_event(
+            "status";
+            message=metal_assembly_mode == :host_staged ?
+                "Initializing BEAT Engine using Metal (host-staged assembly fallback)..." :
+                "Initializing BEAT Engine using native Metal operator assembly and CPU dense solve...",
+        )
+        device_cache = build_metal_regular_assembly_cache(
+            mesh,
+            p1_space,
+            dp0_space,
+            rule;
+            singular_order=singular_order,
+            assembly_mode=metal_assembly_mode,
+            symmetry_mode=Symbol(symmetry_mode),
+        )
+        field_cache = build_metal_field_evaluation_cache(cpu_field_cache)
+        if metal_assembly_mode != :host_staged
+            device_singular_cache = build_metal_singular_correction_cache(singular_cache)
+        end
     else
         emit_event(
             "status";
@@ -878,6 +913,7 @@ function solve_request_impl(request)
                 device_singular_cache=device_singular_cache,
                 device_image_singular_cache=device_image_singular_cache,
                 rocm_assembly_mode=rocm_assembly_mode,
+                metal_assembly_mode=metal_assembly_mode,
                 symmetry_mode=Symbol(symmetry_mode),
             )
         end
@@ -887,6 +923,16 @@ function solve_request_impl(request)
         cpu_solve_system = nothing
         if beat_backend == :cpu
             t_solve += @elapsed begin
+                cpu_solve_system = build_burton_miller_neumann_cpu_system(operators, selected_identity_p1_p1, selected_identity_p1_dp0, k)
+            end
+        elseif beat_backend == :metal
+            # Metal assembles on the GPU and factors on the CPU: copy the
+            # operators down once, release the device storage, and reuse one
+            # factorization across every channel drive like the CPU backend.
+            t_solve += @elapsed begin
+                host_operators = metal_host_operators(operators)
+                release_operator_storage!(operators)
+                operators = host_operators
                 cpu_solve_system = build_burton_miller_neumann_cpu_system(operators, selected_identity_p1_p1, selected_identity_p1_dp0, k)
             end
         end
@@ -1023,6 +1069,15 @@ function solve_request_impl(request)
         end
         if beat_backend == :rocm && device_cache !== nothing
             release_rocm_regular_assembly_cache!(device_cache)
+        end
+        if beat_backend == :metal
+            release_metal_field_evaluation_cache!(field_cache)
+        end
+        if beat_backend == :metal && device_singular_cache !== nothing
+            release_metal_singular_correction_cache!(device_singular_cache)
+        end
+        if beat_backend == :metal && device_cache !== nothing
+            release_metal_regular_assembly_cache!(device_cache)
         end
         if device_image_singular_cache !== nothing
             release_cuda_image_singular_correction_cache!(device_image_singular_cache)

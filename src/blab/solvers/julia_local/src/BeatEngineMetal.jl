@@ -1,0 +1,8 @@
+include(joinpath(@__DIR__, "BeatEngineMetalCommon.jl"))
+include(joinpath(@__DIR__, "BeatEngineMetalRegular.jl"))
+include(joinpath(@__DIR__, "BeatEngineMetalRegularKernels.jl"))
+include(joinpath(@__DIR__, "BeatEngineMetalPairKernels.jl"))
+include(joinpath(@__DIR__, "BeatEngineMetalField.jl"))
+include(joinpath(@__DIR__, "BeatEngineMetalSingular.jl"))
+include(joinpath(@__DIR__, "BeatEngineMetalOperators.jl"))
+include(joinpath(@__DIR__, "BeatEngineMetalAssembly.jl"))

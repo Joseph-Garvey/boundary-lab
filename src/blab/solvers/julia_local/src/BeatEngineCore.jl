@@ -4,16 +4,18 @@ using Base.Threads, LinearAlgebra, SparseArrays, StaticArrays
 
 const BEAT_ACCELERATOR_HINT = let
     configured = lowercase(strip(get(ENV, "BLAB_BEAT_ENGINE_GPU_BACKEND", "")))
-    if configured in ("cuda", "rocm")
+    if configured in ("cuda", "rocm", "metal")
         configured
     else
         active_project = Base.active_project()
         project_directory = active_project === nothing ? "" : lowercase(basename(dirname(active_project)))
-        project_directory == "julia_cuda" ? "cuda" : project_directory == "julia_rocm" ? "rocm" : ""
+        project_directory == "julia_cuda" ? "cuda" :
+            project_directory == "julia_rocm" ? "rocm" :
+            project_directory == "julia_metal" ? "metal" : ""
     end
 end
 
-const CUDA_MODULE = if BEAT_ACCELERATOR_HINT == "rocm"
+const CUDA_MODULE = if BEAT_ACCELERATOR_HINT in ("rocm", "metal")
     nothing
 else
     try
@@ -24,12 +26,23 @@ else
     end
 end
 
-const AMDGPU_MODULE = if BEAT_ACCELERATOR_HINT == "cuda"
+const AMDGPU_MODULE = if BEAT_ACCELERATOR_HINT in ("cuda", "metal")
     nothing
 else
     try
         @eval import AMDGPU
         AMDGPU
+    catch
+        nothing
+    end
+end
+
+const METAL_MODULE = if BEAT_ACCELERATOR_HINT in ("cuda", "rocm")
+    nothing
+else
+    try
+        @eval import Metal
+        Metal
     catch
         nothing
     end
@@ -91,6 +104,22 @@ export BoundaryMesh,
     evaluate_galerkin_field_cpu,
     evaluate_galerkin_field_cuda,
     evaluate_galerkin_field_rocm,
+    build_metal_regular_assembly_cache,
+    release_metal_regular_assembly_cache!,
+    build_metal_singular_correction_cache,
+    release_metal_singular_correction_cache!,
+    build_metal_field_evaluation_cache,
+    release_metal_field_evaluation_cache!,
+    build_metal_burton_miller_identity_cache,
+    release_metal_burton_miller_identity_cache!,
+    build_metal_sparse_scatter_cache,
+    release_metal_sparse_scatter_cache!,
+    scatter_metal_sparse_to_dense!,
+    metal_dense_lu!,
+    solve_metal_dense_factorization,
+    metal_host_operators,
+    assemble_regular_galerkin_operators_metal_regular,
+    evaluate_galerkin_field_metal,
     fibonacci_sphere,
     helmholtz_adjoint_double_layer_kernel,
     helmholtz_double_layer_kernel,
@@ -133,6 +162,11 @@ function amdgpu_module()
     return AMDGPU_MODULE
 end
 
+function metal_module()
+    METAL_MODULE === nothing && error("Metal solve requested, but Metal.jl could not be loaded.")
+    return METAL_MODULE
+end
+
 struct BoundaryMesh{T<:AbstractFloat}
     vertices::Vector{SVector{3,T}}
     faces::Vector{NTuple{3,Int}}
@@ -164,6 +198,12 @@ struct CudaBurtonMillerIdentityCache{A,B}
 end
 
 struct RocmBurtonMillerIdentityCache{A,B}
+    identity_p1_p1::A
+    identity_p1_dp0::B
+end
+
+# Metal keeps the dense solve on the CPU, so this cache holds host matrices.
+struct MetalBurtonMillerIdentityCache{A,B}
     identity_p1_p1::A
     identity_p1_dp0::B
 end
@@ -1127,6 +1167,7 @@ function assemble_regular_galerkin_operators(
     image_near_correction_cache=nothing,
     device_image_near_correction_cache=nothing,
     rocm_assembly_mode=nothing,
+    metal_assembly_mode=nothing,
     symmetry_mode::Symbol=:off,
 ) where {T<:AbstractFloat}
     if backend == :cpu
@@ -1197,7 +1238,29 @@ function assemble_regular_galerkin_operators(
         )
     end
 
-    error("Unsupported BEAT Engine assembly backend: $(backend). Expected :cpu, :cuda, or :rocm.")
+    if backend == :metal
+        accelerator_quadrature || error("Metal regular assembly requires accelerator_quadrature=true.")
+        return assemble_regular_galerkin_operators_metal_regular(
+            mesh,
+            p1_space,
+            dp0_space,
+            k,
+            rule;
+            skip_singular=skip_singular,
+            singular_order=singular_order,
+            element_indices=element_indices,
+            cache=device_cache,
+            return_device=return_device,
+            accelerator_quadrature=true,
+            timing=timing,
+            singular_cache=singular_cache,
+            metal_singular_cache=device_singular_cache,
+            assembly_mode=metal_assembly_mode,
+            symmetry_mode=symmetry_mode,
+        )
+    end
+
+    error("Unsupported BEAT Engine assembly backend: $(backend). Expected :cpu, :cuda, :rocm, or :metal.")
 end
 
 function build_cuda_regular_assembly_cache(args...; kwargs...)
@@ -1342,6 +1405,29 @@ function solve_rocm_dense_factorization(args...; kwargs...)
     error("ROCm dense solve requested, but AMDGPU.jl is not loaded.")
 end
 
+for name in (
+    :build_metal_regular_assembly_cache,
+    :release_metal_regular_assembly_cache!,
+    :build_metal_singular_correction_cache,
+    :release_metal_singular_correction_cache!,
+    :build_metal_field_evaluation_cache,
+    :release_metal_field_evaluation_cache!,
+    :build_metal_burton_miller_identity_cache,
+    :release_metal_burton_miller_identity_cache!,
+    :build_metal_sparse_scatter_cache,
+    :release_metal_sparse_scatter_cache!,
+    :scatter_metal_sparse_to_dense!,
+    :metal_dense_lu!,
+    :solve_metal_dense_factorization,
+    :metal_host_operators,
+    :assemble_regular_galerkin_operators_metal_regular,
+    :evaluate_galerkin_field_metal,
+)
+    @eval function $(name)(args...; kwargs...)
+        error($(string(name)) * " requested, but Metal.jl is not loaded. Run with the julia_metal project on Apple Silicon.")
+    end
+end
+
 function _cuda_burton_miller_rhs(operators, identity_cache::CudaBurtonMillerIdentityCache, d_q_neumann, coupling::Complex{T}) where {T<:AbstractFloat}
     d_rhs = similar(d_q_neumann, size(operators.single_layer, 1))
     mul!(d_rhs, operators.single_layer, d_q_neumann, -one(Complex{T}), zero(Complex{T}))
@@ -1409,6 +1495,14 @@ function solve_burton_miller_neumann(operators, identity_p1_p1, identity_p1_dp0,
             release_rocm_burton_miller_identity_cache!(identity_cache)
         end
     end
+    if gpu_backend == :metal
+        identity_cache = build_metal_burton_miller_identity_cache(identity_p1_p1, identity_p1_dp0, T)
+        try
+            return solve_burton_miller_neumann(operators, identity_cache, q_neumann, k)
+        finally
+            release_metal_burton_miller_identity_cache!(identity_cache)
+        end
+    end
 
     identity_cache = build_cuda_burton_miller_identity_cache(identity_p1_p1, identity_p1_dp0, T)
     try
@@ -1467,6 +1561,10 @@ end
 
 if AMDGPU_MODULE !== nothing
     include(joinpath(@__DIR__, "BeatEngineRocm.jl"))
+end
+
+if METAL_MODULE !== nothing
+    include(joinpath(@__DIR__, "BeatEngineMetal.jl"))
 end
 
 end
