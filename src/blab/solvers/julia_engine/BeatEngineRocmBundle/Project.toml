@@ -1,0 +1,13 @@
+name = "BeatEngineRocmBundle"
+uuid = "4dcecca2-7a78-4163-9eba-4966e709c0e0"
+version = "0.1.0"
+
+[deps]
+AMDGPU = "21141c5a-9bdb-4563-92ae-f87d6854732e"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"

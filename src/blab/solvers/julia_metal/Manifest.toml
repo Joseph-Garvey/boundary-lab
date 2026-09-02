@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "ffd54aca82f447470f8706fec0800f1a0d3c13ff"
+project_hash = "2f6ebc0de3b5fbde7446c69250e0068b26ec8b56"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -64,6 +64,12 @@ version = "0.6.1"
 [[deps.Base64]]
 uuid = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 version = "1.11.0"
+
+[[deps.BeatEngineMetalBundle]]
+deps = ["JSON", "LinearAlgebra", "Metal", "PrecompileTools", "Printf", "SparseArrays", "StaticArrays", "Statistics"]
+path = "../julia_engine/BeatEngineMetalBundle"
+uuid = "046d46cd-a62e-40e9-999a-57ef70256860"
+version = "0.1.0"
 
 [[deps.Bzip2_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]

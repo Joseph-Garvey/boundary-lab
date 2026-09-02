@@ -3,9 +3,25 @@ module BeatEngineCore
 using Base.Threads, LinearAlgebra, SparseArrays, StaticArrays
 
 const BEAT_ACCELERATOR_HINT = let
-    configured = lowercase(strip(get(ENV, "BLAB_BEAT_ENGINE_GPU_BACKEND", "")))
+    # A bundle package in julia_engine/ names its backend here, and it has to:
+    # when these sources are loaded from a package, the environment variable and
+    # the active project are the ones the precompile *cache* was built in, not
+    # the ones the solve runs in, so neither can be trusted to name the
+    # accelerator. The two fallbacks below still apply to a direct `include`,
+    # which is how the analysis scripts and any un-instantiated checkout load
+    # the engine.
+    bundled = let parent = parentmodule(@__MODULE__)
+        isdefined(parent, :BEAT_ENGINE_BACKEND) ?
+            lowercase(strip(String(getfield(parent, :BEAT_ENGINE_BACKEND)))) : ""
+    end
+    configured = isempty(bundled) ?
+        lowercase(strip(get(ENV, "BLAB_BEAT_ENGINE_GPU_BACKEND", ""))) : bundled
     if configured in ("cuda", "rocm", "metal")
         configured
+    elseif configured == "cpu"
+        # A bundle that says "cpu" means it: no GPU package is a dependency of
+        # it, and falling through to the project-name guess would ask for one.
+        "none"
     else
         active_project = Base.active_project()
         project_directory = active_project === nothing ? "" : lowercase(basename(dirname(active_project)))
@@ -15,7 +31,7 @@ const BEAT_ACCELERATOR_HINT = let
     end
 end
 
-const CUDA_MODULE = if BEAT_ACCELERATOR_HINT in ("rocm", "metal")
+const CUDA_MODULE = if BEAT_ACCELERATOR_HINT in ("rocm", "metal", "none")
     nothing
 else
     try
@@ -26,7 +42,7 @@ else
     end
 end
 
-const AMDGPU_MODULE = if BEAT_ACCELERATOR_HINT in ("cuda", "metal")
+const AMDGPU_MODULE = if BEAT_ACCELERATOR_HINT in ("cuda", "metal", "none")
     nothing
 else
     try
@@ -37,7 +53,7 @@ else
     end
 end
 
-const METAL_MODULE = if BEAT_ACCELERATOR_HINT in ("cuda", "rocm")
+const METAL_MODULE = if BEAT_ACCELERATOR_HINT in ("cuda", "rocm", "none")
     nothing
 else
     try
