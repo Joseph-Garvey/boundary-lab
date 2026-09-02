@@ -1,0 +1,189 @@
+# Equivalence and iteration-count gate for the adaptive dense solve.
+#
+# The unit tests in `tests/runtests.jl` check the Krylov invariants on
+# synthetic systems that converge in about 25 iterations. This script runs the
+# same checks against a real assembled Burton-Miller operator, because the
+# defects this path has actually had — a Float32 Arnoldi recurrence losing
+# orthogonality, and a breakdown test that read the Hessenberg subdiagonal
+# after the Givens rotation had zeroed it — both produce a plausible-looking
+# iteration count several times too large, and neither is visible on a problem
+# that finishes in ten steps.
+#
+# That is the general form of the lesson: a numerical routine validated only
+# on cases that converge quickly is not validated for the cases it exists for.
+#
+# What is checked:
+#
+#  1. GMRES agrees with the dense LU to Float32 noise, per drive.
+#  2. The true relative residual meets the tolerance — the tolerance is on
+#     ||b - Ax||/||b|| recomputed against the operator, not on the
+#     preconditioned residual the Givens recursion tracks.
+#  3. Three independent Krylov variants agree on the iteration count:
+#     Float64 space, Float32 with unconditional reorthogonalization, and
+#     Float32 with DGKS. Agreement between independent remedies is the
+#     evidence; no single count is.
+#  4. The count does not depend on the restart length, for restarts above the
+#     count. A converging solver does not care what the restart is; an
+#     iteration count that tracks it is not an iteration count.
+#  5. Plain Float32 single Gram-Schmidt is materially worse, which is what
+#     makes check 3 meaningful rather than vacuous. The failing row is in the
+#     output on purpose: three variants agreeing means something only because
+#     a fourth fails on the same operator.
+#
+# Every check runs at several frequencies. 2 kHz alone would be the easiest
+# corner of this operator -- the uncapped Burton-Miller coupling `eta = i/k`
+# degrades conditioning as k goes to zero, so the bottom of the band is where
+# a conditioning regression would first appear, and a mid-band gate would pass
+# straight through it. That is the same weakness as a test that converges in
+# five iterations, one axis over.
+#
+#   BLAB_VALIDATE_MESH_PATH   absolute mesh path (default: the bundled sample)
+#   BLAB_VALIDATE_SCALE       mesh scale (default 0.001 for the sample)
+#   BLAB_VALIDATE_SYMMETRY    off | x | xy
+#   BLAB_VALIDATE_DRIVES      independent drive columns (default 2)
+#   BLAB_VALIDATE_FREQUENCY_HZ  default 2000
+using LinearAlgebra, Printf, Random
+
+include(joinpath(@__DIR__, "..", "src", "BeatEngineCore.jl"))
+using .BeatEngineCore
+
+const KRYLOV_VARIANTS = (
+    ("float64 dgks", ComplexF64, :dgks),
+    ("float32 always", ComplexF32, :always),
+    ("float32 dgks", ComplexF32, :dgks),
+)
+
+function validate_gmres_burton_miller()
+    mesh_path = get(ENV, "BLAB_VALIDATE_MESH_PATH", "")
+    scale = Float32(parse(Float64, get(ENV, "BLAB_VALIDATE_SCALE", isempty(mesh_path) ? "0.001" : "1.0")))
+    if isempty(mesh_path)
+        mesh_path = joinpath(@__DIR__, "..", "test_meshes", get(ENV, "BLAB_VALIDATE_MESH", "sample.msh"))
+    end
+    symmetry_mode = Symbol(get(ENV, "BLAB_VALIDATE_SYMMETRY", "off"))
+    drive_count = parse(Int, get(ENV, "BLAB_VALIDATE_DRIVES", "2"))
+    regular_order = parse(Int, get(ENV, "BLAB_VALIDATE_REGULAR_ORDER", "4"))
+    singular_order = parse(Int, get(ENV, "BLAB_VALIDATE_SINGULAR_ORDER", "4"))
+    frequencies = Float32.(parse.(Float64, split(get(ENV, "BLAB_VALIDATE_FREQUENCY_HZ", "500,2000,6000"), ",")))
+    tolerance = parse(Float64, get(ENV, "BLAB_VALIDATE_GMRES_TOLERANCE", "1e-6"))
+    agreement_tolerance = parse(Float64, get(ENV, "BLAB_VALIDATE_GMRES_AGREEMENT", "1e-4"))
+
+    mesh = load_gmsh22_with_tags(mesh_path, scale)
+    mesh = snap_symmetry_planes(mesh, symmetry_mode)
+    p1 = build_p1_space(mesh)
+    dp0 = build_dp0_space(mesh)
+    rule = triangle_rule(Float32, regular_order)
+    singular_cache = build_singular_correction_cache(mesh, singular_order)
+    identity_p1_p1 = assemble_l2_identity_matrix(mesh, p1, dp0, rule, :p1, :p1; symmetry_mode=symmetry_mode)
+    identity_p1_dp0 = assemble_l2_identity_matrix(mesh, p1, dp0, rule, :p1, :dp0; symmetry_mode=symmetry_mode)
+
+    n = p1.global_dof_count
+    println("fixture=$(mesh_path) scale=$(scale) symmetry=$(symmetry_mode)")
+    println("faces=$(length(mesh.faces)) p1_dofs=$n frequencies=$(frequencies) drives=$(drive_count)")
+    flush(stdout)
+
+    failures = String[]
+    check(condition, message) = condition || push!(failures, message)
+
+    Random.seed!(20260902)
+    q_neumann = ComplexF32.(randn(Float32, dp0.global_dof_count, drive_count),
+                            randn(Float32, dp0.global_dof_count, drive_count))
+    for frequency_hz in frequencies
+    k = Float32(2pi) * frequency_hz / 343.0f0
+    println()
+    println("--- $(frequency_hz) Hz ---")
+    system = assemble_burton_miller_neumann_system_cpu(
+        mesh, p1, dp0, q_neumann, k, rule;
+        identity_p1_p1=identity_p1_p1, identity_p1_dp0=identity_p1_dp0,
+        skip_singular=false, singular_order=singular_order,
+        singular_cache=singular_cache, symmetry_mode=symmetry_mode,
+    )
+    matrix = system.matrix
+    rhs = system.rhs
+
+    reference = lu(copy(matrix)) \ rhs
+    reference_scale = max(norm(reference), eps(Float32))
+
+    gmres_solution, report = beat_solve_dense_system(matrix, rhs; method=:gmres)
+    agreement = norm(gmres_solution - reference) / reference_scale
+    @printf("gmres_vs_lu_relative=%.3e  iterations=%s  residuals=%s\n",
+            agreement, report.iterations, report.relative_residuals)
+    check(!report.fell_back, "$(frequency_hz) Hz: GMRES fell back to the LU on the default path")
+    check(agreement <= agreement_tolerance,
+          "$(frequency_hz) Hz: GMRES disagrees with the LU by $(agreement), above $(agreement_tolerance)")
+    for drive in 1:drive_count
+        residual = norm(matrix * view(gmres_solution, :, drive) - view(rhs, :, drive)) /
+            max(norm(view(rhs, :, drive)), eps(Float32))
+        check(residual <= 4 * tolerance,
+              "$(frequency_hz) Hz drive $drive: true relative residual $(residual) exceeds 4x the tolerance")
+    end
+
+    # The routing decision itself must be reported, not silently taken.
+    plan = report.plan
+    @printf("plan: method=%s reason=%s lu_model=%.4f s gmres_model=%.4f s\n",
+            plan.method, plan.reason, plan.lu_model_seconds, plan.gmres_model_seconds)
+
+    preconditioner = beat_diagonal_preconditioner(matrix)
+    single_drive_rhs = Vector{ComplexF32}(view(rhs, :, 1))
+    counts = Dict{String,Int}()
+    println()
+    @printf("%-16s %10s %12s %12s\n", "variant", "iterations", "residual", "vs LU")
+    for (label, krylov_type, reorthogonalize) in KRYLOV_VARIANTS
+        x = zeros(ComplexF32, n)
+        result = beat_gmres!(x, matrix, copy(single_drive_rhs);
+                             krylov_type=krylov_type, reorthogonalize=reorthogonalize,
+                             preconditioner=preconditioner, tolerance=tolerance)
+        difference = norm(x - view(reference, :, 1)) / max(norm(view(reference, :, 1)), eps(Float32))
+        @printf("%-16s %10d %12.3e %12.3e%s\n", label, result.iterations,
+                result.relative_residual, difference, result.converged ? "" : "  NOT CONVERGED")
+        check(result.converged, "$(frequency_hz) Hz: $label did not converge")
+        counts[label] = result.iterations
+    end
+
+    baseline = counts["float64 dgks"]
+    check(baseline >= 10,
+          "$(frequency_hz) Hz: the reference variant converged in $baseline iterations, too few to exercise " *
+          "orthogonality loss; use a harder mesh or frequency for this gate to mean anything")
+    for (label, _, _) in KRYLOV_VARIANTS
+        spread = abs(counts[label] - baseline)
+        check(spread <= max(2, baseline ÷ 10),
+              "$(frequency_hz) Hz: $label needed $(counts[label]) iterations against $baseline for the Float64 space")
+    end
+
+    # Restart independence, above the converged count.
+    println()
+    for restart in (baseline + 10, 2 * baseline + 50, 0)
+        x = zeros(ComplexF32, n)
+        result = beat_gmres!(x, matrix, copy(single_drive_rhs);
+                             preconditioner=preconditioner, restart=restart, tolerance=tolerance)
+        @printf("restart=%-6d iterations=%d\n", restart, result.iterations)
+        check(result.iterations == baseline,
+              "$(frequency_hz) Hz: restart $restart changed the count to $(result.iterations) from $baseline; " *
+              "a converging solver does not depend on the restart above its own count")
+    end
+
+    # And the failure mode the remedies exist for must be reachable, or their
+    # agreement above proves nothing.
+    x = zeros(ComplexF32, n)
+    stalled = beat_gmres!(x, matrix, copy(single_drive_rhs);
+                          krylov_type=ComplexF32, reorthogonalize=:never,
+                          preconditioner=preconditioner, tolerance=tolerance)
+    println()
+    @printf("float32 single MGS: %d iterations against %d (the failure the remedies cover)\n",
+            stalled.iterations, baseline)
+    check(stalled.iterations > 2 * baseline,
+          "$(frequency_hz) Hz: single Gram-Schmidt took $(stalled.iterations) against $baseline, so " *
+          "the failure the remedies exist for is not reachable here and their agreement proves nothing")
+    end
+
+    println()
+    if isempty(failures)
+        println("PASS")
+        return true
+    end
+    for failure in failures
+        println("FAIL: $failure")
+    end
+    return false
+end
+
+validate_gmres_burton_miller() || exit(1)

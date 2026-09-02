@@ -1070,13 +1070,17 @@ function solve_request_impl(request)
         t_field = 0.0
         cpu_solve_system = nothing
         fused_pressure = nothing
+        dense_solve_report = nothing
         if assembly_payload.kind === :fused
-            # One factorization per frequency, every channel solved against it,
-            # exactly as the four-operator path reuses its factorization.
+            # Dense LU or diagonally preconditioned GMRES, chosen per solve by
+            # a cost model over (dofs, drives). The LU route keeps the property
+            # the four-operator path has: one factorization per frequency,
+            # every channel solved against it. GMRES has none to share and pays
+            # per drive, which is why the router weighs both dimensions.
             t_solve += @elapsed begin
-                fused_pressure = beat_backend == :metal ?
-                    solve_metal_burton_miller_system(assembly_payload.system) :
-                    solve_burton_miller_neumann_system_cpu(assembly_payload.system)
+                fused_pressure, dense_solve_report = beat_backend == :metal ?
+                    solve_metal_burton_miller_system_with_report(assembly_payload.system) :
+                    solve_burton_miller_neumann_system_cpu_with_report(assembly_payload.system)
             end
         elseif beat_backend == :cpu
             t_solve += @elapsed begin
@@ -1196,8 +1200,24 @@ function solve_request_impl(request)
                     "field_s" => Float32(t_field),
                 ),
                 "diagnostics" => Dict(
-                    "convergence_info" => 0,
-                    "message" => "Julia direct dense solve",
+                    "convergence_info" => dense_solve_report === nothing ? 0 :
+                        (dense_solve_report.fell_back ? 1 : 0),
+                    "message" => dense_solve_report === nothing ? "Julia direct dense solve" :
+                        describe_dense_solve(dense_solve_report),
+                    "dense_solve_method" => dense_solve_report === nothing ? "lu" :
+                        String(dense_solve_report.method),
+                    "dense_solve_selection" => dense_solve_report === nothing ? "fixed" :
+                        String(dense_solve_report.plan.reason),
+                    "dense_solve_fell_back" => dense_solve_report === nothing ? false :
+                        dense_solve_report.fell_back,
+                    "dense_solve_iterations" => dense_solve_report === nothing ? Int[] :
+                        dense_solve_report.iterations,
+                    "dense_solve_relative_residuals" => dense_solve_report === nothing ? Float32[] :
+                        Float32.(dense_solve_report.relative_residuals),
+                    "dense_solve_model_lu_s" => dense_solve_report === nothing ? nothing :
+                        Float32(dense_solve_report.plan.lu_model_seconds),
+                    "dense_solve_model_gmres_s" => dense_solve_report === nothing ? nothing :
+                        Float32(dense_solve_report.plan.gmres_model_seconds),
                     "backend" => String(beat_backend),
                     "symmetry" => symmetry_mode,
                     "regular_assembly_mode" => string(assembly_payload.kind === :fused ?

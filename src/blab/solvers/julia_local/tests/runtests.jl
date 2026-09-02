@@ -361,6 +361,217 @@ end
     @test cached_operators.hypersingular ≈ operators.hypersingular
 end
 
+@testset "adaptive dense solve" begin
+    @testset "cost model routes on both dofs and drives" begin
+        # The measured picture on an M1 Max: at 10,230 dofs GMRES wins for one
+        # drive only, and at 20,422 it wins up to three. A router on size alone
+        # would send a three-way at 10,230 to GMRES and make it 2.2x slower.
+        @test beat_dense_solve_plan(5_107, 1).method === :lu
+        @test beat_dense_solve_plan(10_230, 1).method === :gmres
+        @test beat_dense_solve_plan(10_230, 3).method === :lu
+        @test beat_dense_solve_plan(20_422, 1).method === :gmres
+        @test beat_dense_solve_plan(20_422, 3).method === :gmres
+        @test beat_dense_solve_plan(20_422, 8).method === :lu
+
+        # More drives always pushes the crossover up, never down.
+        crossovers = [beat_dense_solve_crossover_dofs(drives) for drives in 1:6]
+        @test issorted(crossovers)
+        @test beat_dense_solve_crossover_dofs(1) > 5_107
+        @test beat_dense_solve_crossover_dofs(1) < 10_230
+    end
+
+    @testset "explicit override beats the model" begin
+        forced_lu = beat_dense_solve_plan(20_422, 1; method=:lu)
+        @test forced_lu.method === :lu
+        @test forced_lu.reason === :override
+        forced_gmres = beat_dense_solve_plan(1_974, 1; method=:gmres)
+        @test forced_gmres.method === :gmres
+        @test forced_gmres.reason === :override
+        @test beat_dense_solve_plan(1_974, 1).reason === :model
+    end
+
+    @testset "environment parsing" begin
+        @test beat_dense_solve_method("auto") === :auto
+        @test beat_dense_solve_method("") === :auto
+        @test beat_dense_solve_method("LU") === :lu
+        @test beat_dense_solve_method(" gmres ") === :gmres
+        @test_throws ErrorException beat_dense_solve_method("magic")
+    end
+
+    @testset "gmres and lu agree on the same system" begin
+        n = 240
+        rng_matrix = ComplexF32[
+            ComplexF32(cos(0.31f0 * row + 0.17f0 * column), sin(0.23f0 * row - 0.41f0 * column)) / Float32(n)
+            for row in 1:n, column in 1:n
+        ]
+        # Diagonally dominant enough to be well conditioned, as the assembled
+        # Burton-Miller operator is once the identity block is added.
+        matrix = rng_matrix + Matrix{ComplexF32}(2.0f0 * I, n, n)
+        rhs = ComplexF32[
+            ComplexF32(sin(0.7f0 * row + 1.1f0 * drive), cos(0.4f0 * row - 0.3f0 * drive))
+            for row in 1:n, drive in 1:2
+        ]
+
+        reference = lu(copy(matrix)) \ rhs
+        gmres_solution, gmres_report = beat_solve_dense_system(matrix, rhs; method=:gmres)
+        @test gmres_report.method === :gmres
+        @test !gmres_report.fell_back
+        @test length(gmres_report.iterations) == 2
+        @test all(<=(1.0f-6), gmres_report.relative_residuals)
+        @test norm(gmres_solution - reference) / norm(reference) < 1.0f-4
+
+        lu_solution, lu_report = beat_solve_dense_system(matrix, rhs; method=:lu)
+        @test lu_report.method === :lu
+        @test isempty(lu_report.iterations)
+        @test norm(lu_solution - reference) / norm(reference) < 1.0f-6
+
+        # The matrix must survive both routes: the fused Metal path hands over
+        # a shared device buffer the caller still owns.
+        @test matrix[1, 1] == rng_matrix[1, 1] + 2.0f0
+    end
+
+    @testset "gmres solves a single-vector right-hand side" begin
+        n = 96
+        matrix = ComplexF32[
+            ComplexF32(cos(0.5f0 * row * column), sin(0.25f0 * (row + column))) / Float32(n)
+            for row in 1:n, column in 1:n
+        ] + Matrix{ComplexF32}(3.0f0 * I, n, n)
+        rhs = ComplexF32[ComplexF32(row / n, -row / (2n)) for row in 1:n]
+        x = zeros(ComplexF32, n)
+        result = beat_gmres!(x, matrix, rhs)
+        @test result.converged
+        @test result.relative_residual <= 1.0f-6
+        @test norm(matrix * x - rhs) / norm(rhs) <= 1.0f-6
+    end
+
+    @testset "non-convergence falls back to the lu instead of failing" begin
+        # A deliberately hostile system with a one-iteration budget: GMRES
+        # cannot converge, and the caller must still get the right answer.
+        n = 64
+        matrix = ComplexF32[
+            ComplexF32(cos(3.1f0 * row * column), sin(2.7f0 * row - 1.3f0 * column))
+            for row in 1:n, column in 1:n
+        ] + Matrix{ComplexF32}(0.05f0 * I, n, n)
+        rhs = ComplexF32[ComplexF32(sin(0.9f0 * row), cos(0.6f0 * row)) for row in 1:n]
+        reference = lu(copy(matrix)) \ rhs
+
+        withenv("BLAB_BEAT_GMRES_MAX_ITERATIONS" => "1") do
+            solution, report = beat_solve_dense_system(matrix, reshape(rhs, :, 1); method=:gmres)
+            @test report.fell_back
+            @test report.method === :lu
+            @test occursin("after GMRES failed to converge", describe_dense_solve(report))
+            @test norm(vec(solution) - reference) / norm(reference) < 1.0f-4
+        end
+    end
+
+    @testset "zero right-hand side" begin
+        n = 32
+        matrix = Matrix{ComplexF32}(2.0f0 * I, n, n)
+        x = ones(ComplexF32, n)
+        result = beat_gmres!(x, matrix, zeros(ComplexF32, n))
+        @test result.converged
+        @test all(iszero, x)
+    end
+
+
+    @testset "krylov space precision and orthogonality" begin
+        # A spectrum on a circle that nearly touches the origin: GMRES has to
+        # build a real Krylov space rather than terminating in a few steps.
+        # The BEAT operator's own failure appeared past 200 iterations, which
+        # no test here reaches -- see scripts/validate_gmres_burton_miller.jl
+        # for the guard that runs on a real operator. What these assert are the
+        # invariants that were violated, which hold at any length.
+        n = 400
+        eigenvalues = ComplexF32[ComplexF32(1.1) + cis(Float32(2pi * index / n)) for index in 1:n]
+        matrix = Matrix{ComplexF32}(Diagonal(eigenvalues))
+        for row in 1:n, column in (row + 1):n
+            matrix[row, column] += ComplexF32(cos(0.9f0 * row + 0.4f0 * column),
+                                              sin(0.6f0 * row - 0.8f0 * column)) * 0.5f0 / sqrt(Float32(n))
+        end
+        rhs = ComplexF32[ComplexF32(sin(0.31f0 * row), cos(0.17f0 * row)) for row in 1:n]
+
+        function run(krylov_type, reorthogonalize; restart=0)
+            x = zeros(ComplexF32, n)
+            result = beat_gmres!(x, matrix, copy(rhs); krylov_type=krylov_type,
+                                 reorthogonalize=reorthogonalize, restart=restart,
+                                 max_iterations=2000)
+            return result, x
+        end
+
+        float64_result, float64_x = run(ComplexF64, :dgks)
+        @test float64_result.converged
+        # The case must be long enough to be worth running. A test that
+        # converges in five iterations cannot catch an orthogonality failure,
+        # which is exactly how the original bug survived its own unit tests.
+        @test float64_result.iterations >= 15
+        # Independently recomputed, so it differs from the solver's own fused
+        # residual by Float32 rounding. The bound is above 1e-6 for that
+        # reason, not because the solve is loose: at N=400 the achievable true
+        # residual in Float32 is only a few times sqrt(N)*eps.
+        @test norm(matrix * float64_x - rhs) / norm(rhs) <= 3.0f-6
+
+        # Two independent remedies must agree with each other. Agreement is the
+        # evidence; neither count alone is.
+        reorthogonalized_result, reorthogonalized_x = run(ComplexF32, :always)
+        @test reorthogonalized_result.converged
+        @test abs(reorthogonalized_result.iterations - float64_result.iterations) <= 2
+        @test norm(reorthogonalized_x - float64_x) / norm(float64_x) < 1.0f-3
+
+        # And the failure they protect against must actually be reachable here,
+        # or the test above proves nothing. Unreorthogonalized Float32 MGS
+        # needs many times the iterations on this system.
+        stalled_result, _ = run(ComplexF32, :never)
+        @test stalled_result.iterations > 4 * float64_result.iterations
+
+        # A converging solver does not care what the restart is, as long as the
+        # restart exceeds the count it converges in. An iteration count that
+        # tracks the restart parameter is not an iteration count -- that was
+        # the tell that identified the Float32 Arnoldi failure.
+        for restart in (float64_result.iterations + 20, float64_result.iterations + 100, 0)
+            restarted, _ = run(ComplexF64, :dgks; restart=restart)
+            @test restarted.iterations == float64_result.iterations
+        end
+    end
+
+    @testset "krylov precision and reorthogonalization parsing" begin
+        @test beat_gmres_krylov_type("f64") === ComplexF64
+        @test beat_gmres_krylov_type("") === ComplexF64
+        @test beat_gmres_krylov_type("F32") === ComplexF32
+        @test_throws ErrorException beat_gmres_krylov_type("f16")
+        @test beat_gmres_reorthogonalization("dgks") === :dgks
+        @test beat_gmres_reorthogonalization("always") === :always
+        @test beat_gmres_reorthogonalization("never") === :never
+        @test_throws ErrorException beat_gmres_reorthogonalization("sometimes")
+    end
+
+    @testset "an unreachable tolerance stalls out instead of burning the budget" begin
+        # 1e-12 is below the Float32 residual floor, so no number of cycles
+        # reaches it. The run must report the stall promptly and let the caller
+        # fall back, not spend its whole allowance discovering that. It must
+        # also not exceed the Krylov dimension per cycle.
+        n = 40
+        matrix = ComplexF32[
+            ComplexF32(cos(0.5f0 * row * column), sin(0.25f0 * (row + column))) / Float32(n)
+            for row in 1:n, column in 1:n
+        ] + Matrix{ComplexF32}(1.5f0 * I, n, n)
+        rhs = ComplexF32[ComplexF32(row / n, -row / (2n)) for row in 1:n]
+        x = zeros(ComplexF32, n)
+        result = beat_gmres!(x, matrix, rhs; max_iterations=5000, tolerance=1.0e-12)
+        @test !result.converged
+        @test result.iterations <= 2n
+        # It still solved the system as well as Float32 permits.
+        @test norm(matrix * x - rhs) / norm(rhs) < 1.0f-5
+    end
+
+    @testset "diagonal preconditioner tolerates a zero diagonal entry" begin
+        matrix = ComplexF32[1 2; 3 0]
+        inverse = beat_diagonal_preconditioner(matrix)
+        @test inverse[1] == ComplexF32(1)
+        @test inverse[2] == ComplexF32(1)
+        @test all(isfinite, inverse)
+    end
+end
+
 @testset "rigid y0 half-space Green function" begin
     T = Float32
     direct_vertices = [

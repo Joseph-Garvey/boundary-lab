@@ -456,6 +456,22 @@ function assemble_burton_miller_neumann_system_cpu(
     )
 end
 
-function solve_burton_miller_neumann_system_cpu(system)
-    return lu!(copy(system.matrix)) \ system.rhs
+"""
+    solve_burton_miller_neumann_system_cpu_with_report(system; method=beat_dense_solve_method())
+
+Solve the fused CPU system, choosing dense LU or diagonally preconditioned
+GMRES by cost model. Returns `(pressure, report)`; see
+`beat_solve_dense_system`.
+
+The matrix is preserved: `lu!` would overwrite it, and the caller may hold it
+for a diagnostic or a second solve. GMRES never writes to it, so the GMRES
+route also skips the copy the LU route needs.
+"""
+function solve_burton_miller_neumann_system_cpu_with_report(system; method::Symbol=beat_dense_solve_method())
+    return beat_solve_dense_system(system.matrix, system.rhs; method=method, preserve_matrix=true)
+end
+
+function solve_burton_miller_neumann_system_cpu(system; method::Symbol=beat_dense_solve_method())
+    pressure, _ = solve_burton_miller_neumann_system_cpu_with_report(system; method=method)
+    return pressure
 end

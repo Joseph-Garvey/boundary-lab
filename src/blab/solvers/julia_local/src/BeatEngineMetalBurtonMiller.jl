@@ -1038,14 +1038,30 @@ function metal_host_burton_miller_system(system)
 end
 
 """
-    solve_metal_burton_miller_system(system)
+    solve_metal_burton_miller_system_with_report(system; method=beat_dense_solve_method())
 
-Factor the fused system on the host (Metal.jl has no GPU LU) and solve every
-drive against the one factorization. Returns an `N x drives` host matrix of
-boundary pressures. The system is left allocated; the caller releases it.
+Solve the fused system on the host -- Metal.jl has no GPU LU, and the shared
+storage the assembly uses means the host reads the device buffers in place
+rather than copying them. Dense LU or diagonally preconditioned GMRES is
+chosen by cost model over (dofs, drives); see `beat_solve_dense_system`.
+
+Returns `(pressure, report)` with pressure `N x drives`. The system is left
+allocated; the caller releases it.
+
+The LU route factors once and solves every drive against that one
+factorization, which is the property the CPU and Metal backends were built to
+have. GMRES has no factorization to share and pays per drive, which is exactly
+what the router weighs -- and why it is a cost comparison over both dimensions
+rather than a dof threshold.
 """
-function solve_metal_burton_miller_system(system)
+function solve_metal_burton_miller_system_with_report(system; method::Symbol=beat_dense_solve_method())
     host = metal_host_burton_miller_system(system)
-    # lu! would overwrite the shared buffer the caller still owns.
-    return lu!(copy(host.matrix)) \ host.rhs
+    # lu! would overwrite the shared buffer the caller still owns; GMRES reads
+    # it and needs no copy at all.
+    return beat_solve_dense_system(host.matrix, host.rhs; method=method, preserve_matrix=true)
+end
+
+function solve_metal_burton_miller_system(system; method::Symbol=beat_dense_solve_method())
+    pressure, _ = solve_metal_burton_miller_system_with_report(system; method=method)
+    return pressure
 end
