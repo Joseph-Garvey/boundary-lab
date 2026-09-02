@@ -1946,10 +1946,9 @@ function build_coupled_system(
     )
     if bem_backend == :metal
         # The coupled algebra below runs on the CPU for Metal (no GPU LU), so
-        # bring the four operators down once and free the device copies.
-        host_operators = metal_host_operators(operators)
-        release_operator_storage!(operators)
-        operators = host_operators
+        # present the four operators to the host without copying them. The
+        # host tuple wraps the shared device storage in place and owns it.
+        operators = metal_host_operators(operators)
     end
     bem_operator_s = (time_ns() - bem_operator_started) / 1.0e9
     bem_matrix_started = time_ns()

@@ -35,25 +35,42 @@ frequency-independent cache data on the CPU. The Metal worker then:
    one fused kernel per pair and scatters their compact correction blocks
    into the dense operators;
 4. applies symmetry-image contributions and reduced-domain row weights;
-5. copies the four operators to unified host memory, forms the Burton-Miller
-   system, and factors it once per frequency with LAPACK on the CPU, reusing
-   that factorization across every channel drive; and
+5. wraps the four operators as host arrays in place -- they live in Metal
+   shared storage, so nothing is copied -- forms the Burton-Miller system, and
+   factors it once per frequency with LAPACK on the CPU, reusing that
+   factorization across every channel drive; and
 6. evaluates the exterior field with Metal kernels.
 
 ### Coupled FEM-BEM-LEM
 
 Coupled solves take the CPU backend's shape with the BEM stage moved to the
 GPU: sparse FEM assembly and the UMFPACK interior Schur complement run on the
-CPU, the four BEM operators are assembled on Metal and copied to the host,
+CPU, the four BEM operators are assembled on Metal and wrapped on the host,
 and the retained coupled system is factored with the CPU dense LU. The
 condensed formulation is the default, exactly as for the CPU backend, and the
 monolithic formulation remains available for validation. Interior-FEM-only
 solves have no BEM stage and run on the CPU path unchanged.
 
-The dense factorization stays on the CPU because Metal.jl provides no GPU LU.
-On Apple Silicon the copy from device to host is a memcpy within unified
-memory, and the CPU LU runs through Accelerate-class BLAS. The backend's
-dense-size ceiling is therefore the same as the CPU backend's.
+The dense factorization stays on the CPU because Metal.jl provides no GPU LU,
+and the CPU LU runs through Accelerate-class BLAS. The backend's dense-size
+ceiling is therefore the same as the CPU backend's.
+
+There is no device-to-host transfer. The operators are allocated in Metal
+shared storage and handed to the CPU as `unsafe_wrap`ped `Array`s over the same
+buffers, so `metal_host_operators` costs nothing measurable. This is not what
+a private-storage buffer does: `Array(::MtlArray)` on private storage blits
+through a staging buffer at a measured 3.5-8 GB/s, which was 1.1-1.5 s per
+frequency at 10,230 P1 dofs (five gigabytes of operators). Shared storage does
+not slow the assembly kernels -- 4.34-4.41 s against 4.37-4.95 s private on the
+same mesh -- and reading the operators back on the CPU is about 1.5x slower
+per byte than reading a host copy, which costs about 0.19 s of matrix formation
+and is far less than the transfer it removes. `BLAB_METAL_OPERATOR_STORAGE=private`
+restores the copying path.
+
+The host arrays alias device memory, so the operator storage is released once,
+through whichever tuple the caller still holds: the host tuple returned by
+`metal_host_operators` owns the buffers it wrapped, and freeing the device
+tuple while those views are still live leaves them dangling.
 
 Four regular-assembly kernel modes exist. The default, `pair_gather`, is
 the chunked pair-gather design described above. It exists because the
@@ -139,6 +156,7 @@ Normal application use does not require these environment variables.
 | `BLAB_METAL_GATHER_BUDGET_MB` | `512` | Device memory for the pair-block buffer; sets the trial chunk size of `pair_gather`. `BLAB_METAL_GATHER_CHUNK` overrides the chunk size directly. |
 | `BLAB_METAL_GATHER_TIMING` | `0` | Set to `1` to synchronize after each `pair_gather` stage and report `metal_native_gather_*` timings (slower). |
 | `BLAB_METAL_SINGULAR_PARTS` | `4` | Ranges each singular pair's Duffy rule is split into across threads. |
+| `BLAB_METAL_OPERATOR_STORAGE` | `shared` | Use `private` to allocate the operator matrices in private storage and copy them to the host, the pre-2026-09-02 behavior. |
 | `BLAB_METAL_PIPELINE` | `1` | Set to `0` to assemble and solve each sweep frequency sequentially instead of overlapping GPU assembly with the CPU factorization. |
 | `BLAB_METAL_ATOMIC_SCATTER` | `1` | Diagnostic for `pair_atomic` only: `0` skips the atomic scatter to time the pair arithmetic (the operators are then wrong). |
 
@@ -170,7 +188,10 @@ CPU-versus-Metal differences exceed their tolerances.
   solve time should be evaluated after warm-up.
 - Frequency-independent caches remain resident for the worker's lifetime and are
   released when the worker exits.
-- The default `pair_atomic` kernels are not bitwise reproducible run to run
-  (atomic accumulation order); the differences are float32 summation noise.
-  `pair_owned` and `entry_owned` are deterministic. Golden-file comparisons
-  belong on those, tolerance comparisons on the default.
+- The default `pair_gather` kernels are bitwise reproducible run to run, as
+  are `pair_owned` and `entry_owned`. `pair_atomic` is not (atomic
+  accumulation order); its differences are float32 summation noise.
+- Assembly being reproducible does not make a sweep reproducible: the CPU LU
+  is multithreaded, and two runs of the same solve differ by about 3e-7
+  relative in the exterior field. Golden-file comparisons belong on the CPU
+  `reference` path, tolerance comparisons everywhere else.

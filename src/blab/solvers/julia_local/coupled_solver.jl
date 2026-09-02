@@ -979,11 +979,11 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 symmetry_mode=symmetry_mode,
             )
             if backend == :metal
-                # Metal has no GPU LU: copy the operators down once and share
-                # one CPU factorization across every excitation port.
-                host_operators = metal_host_operators(operators)
-                release_operator_storage!(operators)
-                operators = host_operators
+                # Metal has no GPU LU: unified memory lets the host wrap
+                # the operators in place, and one CPU factorization is shared
+                # across every excitation port. The host tuple owns the device
+                # storage and is released after this frequency's solves.
+                operators = metal_host_operators(operators)
             end
             assembly_s = (time_ns() - assembly_started) / 1.0e9
             solve_started = time_ns()

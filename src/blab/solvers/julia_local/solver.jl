@@ -975,13 +975,12 @@ function solve_request_impl(request)
                 cpu_solve_system = build_burton_miller_neumann_cpu_system(operators, selected_identity_p1_p1, selected_identity_p1_dp0, k)
             end
         elseif beat_backend == :metal
-            # Metal assembles on the GPU and factors on the CPU: copy the
-            # operators down once, release the device storage, and reuse one
-            # factorization across every channel drive like the CPU backend.
+            # Metal assembles on the GPU and factors on the CPU: unified
+            # memory lets the host wrap the operators in place, and one
+            # factorization is reused across every channel drive like the CPU
+            # backend.
             t_solve += @elapsed begin
-                host_operators = metal_host_operators(operators)
-                release_operator_storage!(operators)
-                operators = host_operators
+                operators = metal_host_operators(operators)
                 cpu_solve_system = build_burton_miller_neumann_cpu_system(operators, selected_identity_p1_p1, selected_identity_p1_dp0, k)
             end
         end

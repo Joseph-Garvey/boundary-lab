@@ -1,19 +1,38 @@
 # Operator storage, symmetry row weights, the Burton-Miller system, and the
 # dense solve for Metal-assembled operators.
 #
-# Metal.jl has no GPU LU, so the dense factorization runs on the CPU. The
-# operators are copied to the host once per frequency (unified memory makes
-# that a memcpy) and the CPU Burton-Miller system code is reused unchanged,
-# which also gives one factorization per frequency shared across every channel
-# drive, the property the CPU backend has and the CUDA path lacks.
+# Metal.jl has no GPU LU, so the dense factorization runs on the CPU. Apple
+# Silicon is a unified-memory device, so the operators are not copied at all:
+# they are allocated in shared storage and wrapped as host `Array`s in place.
+# The CPU Burton-Miller system code is reused unchanged, which also gives one
+# factorization per frequency shared across every channel drive, the property
+# the CPU backend has and the CUDA path lacks.
 
+const _METAL_OPERATOR_KEYS = (:single_layer, :double_layer, :adjoint_double_layer, :hypersingular)
+
+"""
+    release_operator_storage!(operators)
+
+Free the four dense Burton-Miller operator buffers.
+
+Release exactly once, through whichever tuple you still hold: a device tuple
+frees its own arrays, and a host tuple from `metal_host_operators` frees the
+shared-storage buffers its views alias (`metal_backing`). Releasing the device
+tuple while host views over it are still in use leaves those views dangling.
+"""
 function release_operator_storage!(operators::NamedTuple)
+    backing = get(operators, :metal_backing, nothing)
+    if backing !== nothing
+        for key in _METAL_OPERATOR_KEYS
+            Metal.unsafe_free!(getfield(backing, key))
+        end
+        return nothing
+    end
     get(operators, :on_gpu, false) || return nothing
     get(operators, :gpu_backend, nothing) == :metal || return nothing
-    Metal.unsafe_free!(operators.single_layer)
-    Metal.unsafe_free!(operators.double_layer)
-    Metal.unsafe_free!(operators.adjoint_double_layer)
-    Metal.unsafe_free!(operators.hypersingular)
+    for key in _METAL_OPERATOR_KEYS
+        Metal.unsafe_free!(getfield(operators, key))
+    end
     return nothing
 end
 
@@ -32,21 +51,42 @@ end
 """
     metal_host_operators(operators)
 
-Copy Metal-resident operators to the host as a NamedTuple with the same keys,
-`on_gpu=false`, so every CPU solve routine accepts it. The device storage is
-left allocated; the caller releases it.
+Present Metal-resident operators to the host as a NamedTuple with the same
+keys and `on_gpu=false`, so every CPU solve routine accepts it.
+
+Shared-storage buffers are wrapped in place, so this costs nothing and the
+returned arrays alias device memory: the returned tuple carries the device
+arrays under `metal_backing` and takes ownership of them, so
+`release_operator_storage!` on *it* is what frees them. Release exactly once,
+through whichever tuple you still hold: freeing the device tuple while the host
+views are alive leaves them dangling. Private-storage buffers are copied as
+before, and then the returned tuple owns nothing and the device tuple is still
+the caller's to free.
 """
 function metal_host_operators(operators::NamedTuple)
     get(operators, :gpu_backend, nothing) == :metal || error("metal_host_operators requires Metal operators.")
     Metal.synchronize()
-    host = (
-        single_layer=Array(operators.single_layer),
-        double_layer=Array(operators.double_layer),
-        adjoint_double_layer=Array(operators.adjoint_double_layer),
-        hypersingular=Array(operators.hypersingular),
-    )
-    extras = Base.structdiff(operators, NamedTuple{(:single_layer, :double_layer, :adjoint_double_layer, :hypersingular, :on_gpu)})
-    return merge(extras, host, (on_gpu=false, host_copy_of=:metal))
+    shared = all(Metal.is_shared(getfield(operators, key)) for key in _METAL_OPERATOR_KEYS)
+    host = if shared
+        (
+            single_layer=unsafe_wrap(Array, operators.single_layer),
+            double_layer=unsafe_wrap(Array, operators.double_layer),
+            adjoint_double_layer=unsafe_wrap(Array, operators.adjoint_double_layer),
+            hypersingular=unsafe_wrap(Array, operators.hypersingular),
+        )
+    else
+        (
+            single_layer=Array(operators.single_layer),
+            double_layer=Array(operators.double_layer),
+            adjoint_double_layer=Array(operators.adjoint_double_layer),
+            hypersingular=Array(operators.hypersingular),
+        )
+    end
+    backing = shared ? NamedTuple{_METAL_OPERATOR_KEYS}(
+        map(key -> getfield(operators, key), _METAL_OPERATOR_KEYS),
+    ) : nothing
+    extras = Base.structdiff(operators, NamedTuple{(:single_layer, :double_layer, :adjoint_double_layer, :hypersingular, :on_gpu, :metal_backing)})
+    return merge(extras, host, (on_gpu=false, host_copy_of=:metal, metal_backing=backing))
 end
 
 function build_metal_burton_miller_identity_cache(identity_p1_p1, identity_p1_dp0, ::Type{T}) where {T<:AbstractFloat}

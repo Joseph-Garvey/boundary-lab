@@ -44,12 +44,13 @@ function _assemble_regular_galerkin_operators_metal_native(
     singular_mode = _normalized_metal_singular_mode()
 
     operators = nothing
+    storage = metal_operator_storage_mode()
     allocation_elapsed = @elapsed begin
         operators = (
-            single_layer=Metal.zeros(Complex{T}, p1_space.global_dof_count, dp0_space.global_dof_count),
-            double_layer=Metal.zeros(Complex{T}, p1_space.global_dof_count, p1_space.global_dof_count),
-            adjoint_double_layer=Metal.zeros(Complex{T}, p1_space.global_dof_count, dp0_space.global_dof_count),
-            hypersingular=Metal.zeros(Complex{T}, p1_space.global_dof_count, p1_space.global_dof_count),
+            single_layer=Metal.zeros(Complex{T}, p1_space.global_dof_count, dp0_space.global_dof_count; storage=storage),
+            double_layer=Metal.zeros(Complex{T}, p1_space.global_dof_count, p1_space.global_dof_count; storage=storage),
+            adjoint_double_layer=Metal.zeros(Complex{T}, p1_space.global_dof_count, dp0_space.global_dof_count; storage=storage),
+            hypersingular=Metal.zeros(Complex{T}, p1_space.global_dof_count, p1_space.global_dof_count; storage=storage),
         )
         Metal.synchronize()
     end

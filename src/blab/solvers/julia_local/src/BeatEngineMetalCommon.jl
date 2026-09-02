@@ -9,6 +9,26 @@
 
 using Metal: MtlArray, thread_position_in_grid_1d
 
+const BEAT_METAL_OPERATOR_STORAGE_ENV = "BLAB_METAL_OPERATOR_STORAGE"
+
+"""
+    metal_operator_storage_mode()
+
+Storage mode for the four dense Burton-Miller operator matrices.
+
+Apple Silicon is a unified-memory device, so a shared-storage buffer can be
+wrapped as a host `Array` with no copy at all; a private-storage buffer has to
+be blitted through a staging buffer, which measured 3.5-8 GB/s and cost
+1.1-1.5 s per frequency at 10,230 P1 dofs. Shared is therefore the default.
+Set `BLAB_METAL_OPERATOR_STORAGE=private` to fall back to the copying path.
+"""
+function metal_operator_storage_mode()
+    requested = lowercase(strip(get(ENV, BEAT_METAL_OPERATOR_STORAGE_ENV, "shared")))
+    requested in ("shared", "private") ||
+        error("$BEAT_METAL_OPERATOR_STORAGE_ENV must be shared or private; got $(repr(requested)).")
+    return requested == "shared" ? Metal.SharedStorage : Metal.PrivateStorage
+end
+
 struct MetalSingularCorrectionCache{T}
     pair_offsets
     test_indices

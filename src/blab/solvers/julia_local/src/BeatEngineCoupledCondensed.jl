@@ -674,9 +674,8 @@ function build_condensed_coupled_system(
             device_singular_cache=prepared.device_singular_cache,
             symmetry_mode=prepared.symmetry_mode,
         )
-        host_operators = metal_host_operators(device_operators)
-        release_operator_storage!(device_operators)
-        host_operators
+        # Wraps the shared device storage in place; the host tuple owns it.
+        metal_host_operators(device_operators)
     else
         assemble_condensed_regular_operators(
             bem_mesh,
