@@ -11,12 +11,13 @@
 #   per drive, with no factorization to share.
 #
 # Both are measured on the ATH ladder (see the head-to-head document). GMRES
-# needs 35-89 iterations on this operator, so it is O(N^2) against the LU's
-# O(N^3) and the two cross -- between 2,000 and 5,000 P1 dofs at one drive.
-# In the drive count the ranking is the other way round, because the LU
-# amortises its factorization across every drive and GMRES does not, and that
-# drive crossover itself grows with N (2.4-2.7 drives at 5,107 dofs, 4.6-7.4 at
-# 10,230). There is therefore no pair of thresholds to route on.
+# needs 51-136 iterations on this operator at a 1e-6 true residual, so it is
+# O(N^2) against the LU's O(N^3) and the two cross -- between 2,000 and 5,000
+# P1 dofs at one drive. In the drive count the ranking is the other way round,
+# because the LU amortises its factorization across every drive and GMRES does
+# not, and that drive crossover itself grows strongly with N: ~2.4 drives at
+# 5,107 dofs, ~4.0 at 10,230, ~11 at 20,422. There is therefore no pair of
+# thresholds to route on.
 #
 # An earlier revision of this file quoted "206-246 iterations, flat in N". That
 # band was a Float32 Arnoldi recurrence losing orthogonality, not the operator;
@@ -39,13 +40,15 @@
 # rather than weaker.
 #
 # GMRES falls back to the dense LU when it does not converge, reporting the
-# fallback rather than raising. BEAT's Burton-Miller operator does not stagnate
-# on the meshes tried, including the sliver-rim meshes where
-# hornlab-metal-bem's GMRES returns `info=-999`, so this is a safety net rather
-# than a load-bearing part of the feature. It earned its place during
-# development regardless: the Float32 Arnoldi bug made a 10,230-dof solve fail
-# to converge at 2 kHz, and the fallback turned that into a correct answer at
-# the LU's price instead of a failed solve.
+# fallback rather than raising. **This is load-bearing, not a safety net.** An
+# earlier revision of this comment claimed the operator never stagnates; that
+# was measured with the unreorthogonalised Float32 recurrence and is false. On
+# the sliver-rim ATH meshes, driven by the physical excitation rather than a
+# random one, GMRES floors at a true residual of 1.2e-6 to 9.4e-6 and cannot
+# reach 1e-6 below about 6 kHz -- the same mesh family and the same frequencies
+# where hornlab-metal-bem's GMRES returns `info=-999`. The geometry defeats
+# Krylov in both engines; what distinguishes this one is that it degrades to a
+# correct answer instead of killing the sweep.
 
 const BEAT_DENSE_SOLVE_METHOD_ENV = "BLAB_BEAT_DENSE_SOLVE"
 const BEAT_GMRES_TOLERANCE_ENV = "BLAB_BEAT_GMRES_TOL"
@@ -197,6 +200,47 @@ function beat_gmres_seconds(n::Integer, drive_count::Integer=1)
     n <= 0 && return 0.0
     iterations = _beat_env_float(BEAT_GMRES_MODEL_ITERATIONS_ENV, BEAT_GMRES_MODEL_ITERATIONS_DEFAULT)
     return max(1, drive_count) * iterations * beat_dense_matvec_seconds(n)
+end
+
+"""How much LU-equivalent work a model-chosen GMRES may spend before it stops.
+
+One is the value that makes the argument: at a budget of one LU, a GMRES that
+exhausts it and falls back has cost one LU of matvecs plus the factorization it
+should have done, so the worst case is bounded at twice the direct solve. The
+knob exists because that bound trades against false abandons -- a run that
+would have converged a few iterations past the budget is stopped at 2x when it
+would have finished near 1.2x -- and the balance is a property of how heavy the
+operator's tail is, which differs by mesh family."""
+const BEAT_GMRES_BUDGET_FACTOR_ENV = "BLAB_BEAT_GMRES_BUDGET"
+const BEAT_GMRES_BUDGET_FACTOR_DEFAULT = 1.0
+
+"""
+    beat_gmres_iteration_budget(n, drive_count)
+
+Total matvecs a model-chosen GMRES may spend across every drive before the
+dense LU is provably the cheaper answer.
+
+`BEAT_GMRES_MODEL_ITERATIONS` is the model's weakest constant by a wide margin.
+It ships at 70; measured on this branch over three meshes and three frequencies
+the true count runs from 39 to 549, and it is not monotone in either dofs or
+frequency, so no single value is right. The router therefore cannot avoid
+choosing GMRES on operators that need six times what it assumed, and with the
+iteration cap set to `min(n, 1000)` the resulting loss is unbounded: at 4,751
+dofs and 6 kHz a GMRES the router picked spent 429 iterations to beat a 0.88 s
+factorization in 3.40 s.
+
+The budget converts that into a bounded one. Exceeding it is not a failure to
+be retried but the discovery that the routing decision was wrong, and the
+correct response to that discovery is the LU. It applies only when the model
+chose GMRES: an explicit `BLAB_BEAT_DENSE_SOLVE=gmres` is an instruction, and
+benchmarking the Krylov path against the direct one needs it to run to the end.
+"""
+function beat_gmres_iteration_budget(n::Integer, drive_count::Integer=1)
+    n <= 0 && return typemax(Int)
+    matvec = beat_dense_matvec_seconds(n)
+    matvec > 0 || return typemax(Int)
+    factor = _beat_env_float(BEAT_GMRES_BUDGET_FACTOR_ENV, BEAT_GMRES_BUDGET_FACTOR_DEFAULT)
+    return max(1, floor(Int, factor * beat_dense_lu_seconds(n, drive_count) / matvec))
 end
 
 """
@@ -656,16 +700,29 @@ function beat_solve_dense_system(matrix::AbstractMatrix{Complex{T}},
         solution = similar(rhs_matrix, Complex{T}, n, drive_count)
         fill!(solution, zero(Complex{T}))
         inverse_diagonal = beat_diagonal_preconditioner(matrix)
-        iterations = Vector{Int}(undef, drive_count)
-        residuals = Vector{T}(undef, drive_count)
+        iterations = Int[]
+        residuals = T[]
         converged = true
+        # A model-chosen GMRES gets one LU's worth of matvecs across every
+        # drive; an explicitly requested one is left alone. `ceiling` is the
+        # hard stall guard and still applies.
+        ceiling = _beat_gmres_max_iterations(n)
+        remaining = plan.reason === :model ?
+                    beat_gmres_iteration_budget(n, drive_count) : typemax(Int)
         gmres_elapsed = @elapsed for drive in 1:drive_count
             column = view(solution, :, drive)
             result = beat_gmres!(column, matrix, Vector{Complex{T}}(view(rhs_matrix, :, drive));
-                                 preconditioner=inverse_diagonal)
-            iterations[drive] = result.iterations
-            residuals[drive] = result.relative_residual
-            result.converged || (converged = false)
+                                 preconditioner=inverse_diagonal,
+                                 max_iterations=min(ceiling, max(remaining, 1)))
+            push!(iterations, result.iterations)
+            push!(residuals, result.relative_residual)
+            remaining -= result.iterations
+            if !result.converged
+                # The fallback re-solves every column against one factorization,
+                # so any Krylov work on the remaining drives would be discarded.
+                converged = false
+                break
+            end
         end
         if converged
             return solution, (

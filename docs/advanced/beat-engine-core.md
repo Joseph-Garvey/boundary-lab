@@ -262,13 +262,31 @@ A related tell for the first: with a degraded basis, *more* restarting gives
 is backwards for a healthy solver, where a larger Krylov space can only help.
 
 GMRES falls back to the dense LU when it does not converge, reporting the
-fallback in the run's diagnostics rather than raising. The operator does not
-stagnate on the meshes tried, so this is a safety net rather than a load-bearing
-part of the feature — but it earned its place during development, when an
-unreachable tolerance turned a working solve into a failed one.
+fallback in the run's diagnostics rather than raising. **This is load-bearing,
+not a safety net.** On sliver-rimmed meshes the operator floors out at a true
+residual of 2e-6 to 9e-6 and cannot reach 1e-6 at the low end of the band, so
+the fallback is what makes those solves work at all. A Krylov path that raised
+on non-convergence would fail them outright.
+
+The known cost is that the router cannot see this coming — it prices a
+converging GMRES — so on such a mesh the solve pays for the failed attempt and
+the factorization, about 1.8x the LU alone. It is a routing defect rather than
+a correctness one: the answer is right either way. See the head-to-head
+document's "Known regression: A1r routes to GMRES and loses" for the
+measurements and the candidate fixes.
+
+The achievable *true* residual has a Float32 floor, and it depends on how the
+residual is evaluated. The solver computes `b - Ax` as one fused gemv
+accumulating into `b`; forming `Ax` in full and subtracting afterwards cancels
+and costs about `sqrt(N) * eps` — 1.1e-5 at 7,890 dofs, an order above the
+1e-6 the solver is asked for. Both numbers are honest; they measure different
+things, and below that floor the second is measuring Float32 subtraction rather
+than the solve. The quantity to judge a solve by is its agreement with the
+dense LU.
 
 `scripts/validate_gmres_burton_miller.jl` gates all of this against a real
-assembled operator across the frequency band. It asserts that the reference
+assembled operator across the frequency band, under symmetry off, x and xy,
+and on the sliver-rim ATH meshes via `BLAB_VALIDATE_MESH_PATH`. It asserts that the reference
 variant needs at least ten iterations, and that plain single Gram-Schmidt fails
 on the same system: three variants agreeing is evidence only because a fourth
 demonstrably fails. A routine validated only on cases that converge in five
