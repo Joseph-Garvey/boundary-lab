@@ -72,12 +72,15 @@ function validate_metal_fused_burton_miller()
             device_singular_cache=device_singular_cache, symmetry_mode=symmetry_mode,
         )
     end
+    # metal_host_operators takes ownership of shared-storage buffers, so the
+    # host tuple is what gets released, and only once the matrices built from
+    # it are materialised.
     host_operators = metal_host_operators(reference_operators)
-    release_operator_storage!(reference_operators)
     reference_lhs, reference_rhs_operator = BeatEngineCore.burton_miller_neumann_matrices(
         host_operators, identity_p1_p1, identity_p1_dp0, k,
     )
     reference_rhs = reference_rhs_operator * q_neumann
+    release_operator_storage!(host_operators)
 
     fused_timing = Dict{String,Float64}()
     fused = nothing

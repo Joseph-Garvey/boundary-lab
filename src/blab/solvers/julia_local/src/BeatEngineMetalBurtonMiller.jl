@@ -864,9 +864,14 @@ function assemble_burton_miller_neumann_system_metal(
     succeeded = false
     empty!(_metal_gather_stage_timing)
     try
+        storage = metal_operator_storage_mode()
         allocation_elapsed = @elapsed begin
-            lhs = Metal.zeros(Complex{T}, p1_count, p1_count)
-            rhs = Metal.zeros(Complex{T}, p1_count, drive_count)
+            # The system matrix and right-hand side go to the same storage mode
+            # as the four operators, so the host can wrap them in place instead
+            # of blitting them through a staging buffer. The pair-block and
+            # right-hand-side partials are device-only scratch and stay private.
+            lhs = Metal.zeros(Complex{T}, p1_count, p1_count; storage=storage)
+            rhs = Metal.zeros(Complex{T}, p1_count, drive_count; storage=storage)
             rhs_partial = Metal.zeros(Complex{T}, p1_count, tables.chunk_size, drive_count)
             Metal.synchronize()
         end
@@ -997,23 +1002,50 @@ function assemble_burton_miller_neumann_system_metal(
 end
 
 function release_metal_burton_miller_system!(system)
+    backing = get(system, :metal_backing, nothing)
+    if backing !== nothing
+        Metal.unsafe_free!(backing.matrix)
+        Metal.unsafe_free!(backing.rhs)
+        return nothing
+    end
+    get(system, :on_gpu, false) || return nothing
     Metal.unsafe_free!(system.matrix)
     Metal.unsafe_free!(system.rhs)
     return nothing
 end
 
 """
+    metal_host_burton_miller_system(system)
+
+Present the fused system to the host. Shared-storage buffers are wrapped in
+place, so this costs nothing and the returned arrays alias device memory; the
+returned tuple carries the device arrays under `metal_backing` and owns them,
+exactly as `metal_host_operators` does for the four-operator path. Release
+once, through whichever tuple you still hold.
+"""
+function metal_host_burton_miller_system(system)
+    get(system, :on_gpu, false) || return system
+    Metal.synchronize()
+    shared = Metal.is_shared(system.matrix) && Metal.is_shared(system.rhs)
+    host = shared ?
+        (matrix=unsafe_wrap(Array, system.matrix), rhs=unsafe_wrap(Array, system.rhs)) :
+        (matrix=Array(system.matrix), rhs=Array(system.rhs))
+    backing = shared ? (matrix=system.matrix, rhs=system.rhs) : nothing
+    extras = Base.structdiff(system, NamedTuple{(:matrix, :rhs, :on_gpu, :metal_backing)})
+    # Private storage leaves the device tuple the caller's to free; shared
+    # storage hands ownership of the wrapped buffers to the returned tuple.
+    return merge(extras, host, (on_gpu=false, metal_backing=backing))
+end
+
+"""
     solve_metal_burton_miller_system(system)
 
-Copy the fused system to the host, factor it there (Metal.jl has no GPU LU) and
-solve every drive against the one factorization. Returns an `N x drives` host
-matrix of boundary pressures; the device system is released.
+Factor the fused system on the host (Metal.jl has no GPU LU) and solve every
+drive against the one factorization. Returns an `N x drives` host matrix of
+boundary pressures. The system is left allocated; the caller releases it.
 """
 function solve_metal_burton_miller_system(system)
-    get(system, :on_gpu, false) || error("Fused Metal Burton-Miller solve requires a GPU-resident system.")
-    Metal.synchronize()
-    host_matrix = Array(system.matrix)
-    host_rhs = Array(system.rhs)
-    release_metal_burton_miller_system!(system)
-    return lu!(host_matrix) \ host_rhs
+    host = metal_host_burton_miller_system(system)
+    # lu! would overwrite the shared buffer the caller still owns.
+    return lu!(copy(host.matrix)) \ host.rhs
 end
