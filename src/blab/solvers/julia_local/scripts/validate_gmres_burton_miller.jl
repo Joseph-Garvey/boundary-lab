@@ -30,12 +30,24 @@
 #     output on purpose: three variants agreeing means something only because
 #     a fourth fails on the same operator.
 #
-# Every check runs at several frequencies. 2 kHz alone would be the easiest
-# corner of this operator -- the uncapped Burton-Miller coupling `eta = i/k`
-# degrades conditioning as k goes to zero, so the bottom of the band is where
-# a conditioning regression would first appear, and a mid-band gate would pass
-# straight through it. That is the same weakness as a test that converges in
-# five iterations, one axis over.
+# Every check runs across the band rather than at one frequency, and which end
+# is hard depends on the mesh, so do not "simplify" this to a single point.
+# Two mechanisms pull in opposite directions:
+#
+#  * Low-k conditioning. The uncapped Burton-Miller coupling `eta = i/k` grows
+#    without bound as k goes to zero, so the bottom of the band is hard. This
+#    dominates on well-resolved meshes: on the ATH ladder's A5 (5,107 dofs) the
+#    counts are 70 / 51 / 51 at 500 / 2000 / 6000 Hz.
+#  * High kh. A coarse mesh runs out of elements per wavelength, so the top of
+#    the band is hard. This dominates here: on the bundled 1,390-dof sample the
+#    counts are 44 / 51 / 63 over the same frequencies -- the opposite ordering.
+#
+# So 6 kHz is this fixture's hard corner and 500 Hz is the ladder's. A gate at
+# mid-band alone would pass straight through either. Guarding the low-k
+# coupling path specifically needs a ladder-sized mesh via
+# BLAB_VALIDATE_MESH_PATH; the bundled fixture cannot exhibit that failure at
+# all. Same principle as the iteration floor below: put the gate against the
+# hard corner of the configuration it actually runs in.
 #
 #   BLAB_VALIDATE_MESH_PATH   absolute mesh path (default: the bundled sample)
 #   BLAB_VALIDATE_SCALE       mesh scale (default 0.001 for the sample)

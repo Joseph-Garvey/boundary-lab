@@ -366,18 +366,26 @@ end
         # The measured picture on an M1 Max: at 10,230 dofs GMRES wins for one
         # drive only, and at 20,422 it wins up to three. A router on size alone
         # would send a three-way at 10,230 to GMRES and make it 2.2x slower.
-        @test beat_dense_solve_plan(5_107, 1).method === :lu
+        # Measured on the ATH ladder, per-frequency solve seconds:
+        #   5,107  1 drive : GMRES 0.297 vs LU 0.725   -> GMRES
+        #   5,107  3 drives: GMRES 0.941 vs LU 0.784   -> LU
+        #  10,230  1 drive : GMRES 1.632 vs LU 5.601   -> GMRES
+        #  20,422  1 drive : GMRES 5.063 vs LU 49.30   -> GMRES
+        #  20,422  4 drives: GMRES 18.32 vs LU 48.21   -> GMRES
+        @test beat_dense_solve_plan(1_974, 1).method === :lu
+        @test beat_dense_solve_plan(5_107, 1).method === :gmres
+        @test beat_dense_solve_plan(5_107, 3).method === :lu
         @test beat_dense_solve_plan(10_230, 1).method === :gmres
-        @test beat_dense_solve_plan(10_230, 3).method === :lu
         @test beat_dense_solve_plan(20_422, 1).method === :gmres
-        @test beat_dense_solve_plan(20_422, 3).method === :gmres
-        @test beat_dense_solve_plan(20_422, 8).method === :lu
+        @test beat_dense_solve_plan(20_422, 4).method === :gmres
+        @test beat_dense_solve_plan(20_422, 24).method === :lu
 
         # More drives always pushes the crossover up, never down.
         crossovers = [beat_dense_solve_crossover_dofs(drives) for drives in 1:6]
         @test issorted(crossovers)
-        @test beat_dense_solve_crossover_dofs(1) > 5_107
-        @test beat_dense_solve_crossover_dofs(1) < 10_230
+        # Independently measured between 2,000 and 5,000 dofs at one drive.
+        @test beat_dense_solve_crossover_dofs(1) > 2_000
+        @test beat_dense_solve_crossover_dofs(1) < 5_000
     end
 
     @testset "explicit override beats the model" begin

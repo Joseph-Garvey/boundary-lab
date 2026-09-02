@@ -67,28 +67,30 @@ const BEAT_GMRES_RESTART_ENV = "BLAB_BEAT_GMRES_RESTART"
 
 """Effective complex GEMM throughput of the dense LU, GFLOP/s.
 
-Measured 408-534 GFLOP/s across the ladder with no degradation at the top
-(492 GFLOP/s at 20,422 dofs), so one constant fits the whole range."""
+Measured 457-511 GFLOP/s over 2,048 to 20,422 dofs with no degradation at the
+top (508 GFLOP/s at 20,422), so one constant fits the whole range."""
 const BEAT_DENSE_LU_GFLOPS_ENV = "BLAB_BEAT_LU_GFLOPS"
-const BEAT_DENSE_LU_GFLOPS_DEFAULT = 500.0
+const BEAT_DENSE_LU_GFLOPS_DEFAULT = 480.0
 
 """Streaming cost of one dense complex matvec, seconds per matrix entry.
 
-8 bytes per Complex{Float32} entry against the asymptotic ~84 GB/s that a
-threaded `cgemv` approaches on this machine."""
+8 bytes per Complex{Float32} entry against the asymptotic bandwidth a threaded
+`cgemv` approaches here. Fitted, with the term below, to measured matvecs at
+2,048 / 5,107 / 10,230 dofs."""
 const BEAT_DENSE_MATVEC_ENTRY_SECONDS_ENV = "BLAB_BEAT_MATVEC_ENTRY_SECONDS"
-const BEAT_DENSE_MATVEC_ENTRY_SECONDS_DEFAULT = 9.52e-11
+const BEAT_DENSE_MATVEC_ENTRY_SECONDS_DEFAULT = 1.071e-10
 
 """Non-streaming part of one dense complex matvec, seconds per dof.
 
 The matvec does not run at its asymptotic bandwidth on a small matrix: the
-measured effective rate rises with N as the transfer saturates. This linear
-term is what reproduces that ramp, and it is why the model's local exponent
-comes out sub-quadratic over the useful range instead of being forced to 2.
-Fitting `iterations * 8N^2 / bandwidth` with a single bandwidth constant
-misplaces the crossover at both ends."""
+measured effective rate rises from 39.7 GB/s at 5,107 dofs to 67.7 GB/s at
+20,422 as the transfer saturates. This linear term is what reproduces that
+ramp, and it is why the model's local exponent comes out sub-quadratic over the
+useful range instead of being forced to 2. Fitting
+`iterations * 8N^2 / bandwidth` with a single bandwidth constant misplaces the
+crossover at both ends."""
 const BEAT_DENSE_MATVEC_DOF_SECONDS_ENV = "BLAB_BEAT_MATVEC_DOF_SECONDS"
-const BEAT_DENSE_MATVEC_DOF_SECONDS_DEFAULT = 1.03e-6
+const BEAT_DENSE_MATVEC_DOF_SECONDS_DEFAULT = 4.236e-7
 
 """Iterations a diagonally preconditioned GMRES is expected to need.
 
@@ -97,16 +99,22 @@ re-measure whenever the formulation, the coupling parameter or the quadrature
 changes.
 
 It is a compromise, not an invariant, and the docstring says so because the
-number it replaced was presented as one. The measured count is 35-89: it rises
-at the low-frequency end of a sweep, because BEAT uses the uncapped
-Burton-Miller coupling `eta = i/k` whose conditioning degrades as k goes to
-zero, and it rises on sliver-rim meshes. The default is set toward the high end
-of that range deliberately -- over-estimating iterations routes a marginal
-problem to the LU, which is never catastrophically wrong, whereas
-under-estimating routes it to a Krylov solve that then costs several times the
-model's guess."""
+number it replaced was presented as one. Measured on the ATH ladder at
+tolerance 1e-6 on the true residual:
+
+    mesh   N        500 Hz   2 kHz   6 kHz
+    A5     5,107      70       51      51
+    A2r   10,230     119       85      63
+    A5r   20,422      --       79      --
+
+Roughly flat in N and a factor of ~2 in frequency, harder at the bottom of the
+band because the uncapped Burton-Miller coupling `eta = i/k` degrades
+conditioning as k goes to zero. 70 is mid-range rather than worst case: it
+misroutes only where the two costs are within a few percent of each other, and
+being wrong there costs a few percent. A worst-case 119 would additionally send
+genuine GMRES wins at 5,107 dofs to the LU."""
 const BEAT_GMRES_MODEL_ITERATIONS_ENV = "BLAB_BEAT_GMRES_MODEL_ITERATIONS"
-const BEAT_GMRES_MODEL_ITERATIONS_DEFAULT = 210.0
+const BEAT_GMRES_MODEL_ITERATIONS_DEFAULT = 70.0
 
 """Effective bandwidth of one triangular solve against the LU factor, GB/s.
 
@@ -115,7 +123,7 @@ rate: a triangular solve is sequential in the row dimension and measures
 13-17 GB/s where `cgemv` reaches 42-55. Its own constant, because the LU-side
 drive term is what the router weighs GMRES against."""
 const BEAT_DENSE_TRIANGULAR_GBPS_ENV = "BLAB_BEAT_TRIANGULAR_GBPS"
-const BEAT_DENSE_TRIANGULAR_GBPS_DEFAULT = 14.0
+const BEAT_DENSE_TRIANGULAR_GBPS_DEFAULT = 17.0
 
 function _beat_env_float(name::AbstractString, default::Float64)
     text = strip(get(ENV, name, ""))
@@ -289,8 +297,12 @@ const BEAT_GMRES_REORTHOGONALIZE_ENV = "BLAB_BEAT_GMRES_REORTHOGONALIZE"
 """Fraction of the target the inner Givens recursion aims at.
 
 The recursion measures the preconditioned residual and the tolerance is on the
-true one; overshooting the inner target by 5x and verifying afterwards is
-cheaper than bounding the preconditioner's norm."""
+true one, so the inner cycle aims well past the target and the outer loop
+verifies. The margin is not free to choose loosely: at 0.2 a 10,230-dof solve
+handed back at a true residual of 1.02e-6 against a 1e-6 tolerance, the next
+cycle improved by too little to clear the stall check, and the whole Krylov
+solve was discarded for a dense LU over a 2% miss. Overshooting costs a few
+iterations; missing costs the entire factorization."""
 const BEAT_GMRES_INNER_MARGIN = 0.2
 
 """DGKS threshold: reorthogonalize when a vector loses this much of its norm."""
@@ -575,12 +587,28 @@ function _beat_gmres_update!(x::AbstractVector{Complex{T}},
         pivot = hessenberg[i, i]
         y[i] = pivot == 0 ? ComplexF64(0) : accumulated / pivot
     end
+    # Accumulate the update in the Krylov precision, not the solution's.
+    #
+    # x = x + sum_i y_i v_i over `used` terms. Summing that in Float32 carries a
+    # relative error of about sqrt(used) * eps, which floors the achievable true
+    # residual at roughly 1.1e-6 by 80 terms and 1.6e-6 by 175 -- and the floor
+    # rises with the iteration count, so running longer makes the answer worse.
+    # Measured at 10,230 dofs: 117 iterations reached 9.65e-7, 174 iterations
+    # reached 1.33e-6. Accumulating in Float64 and rounding once at the end
+    # removes the floor for the cost of one N-vector.
+    accumulator = Vector{ComplexF64}(undef, length(x))
+    @inbounds for index in eachindex(x)
+        accumulator[index] = ComplexF64(x[index])
+    end
     @inbounds for i in 1:used
-        coefficient = Complex{T}(y[i])
+        coefficient = y[i]
         vector = basis[i]
-        for index in eachindex(x)
-            x[index] += coefficient * Complex{T}(vector[index])
+        for index in eachindex(accumulator)
+            accumulator[index] += coefficient * ComplexF64(vector[index])
         end
+    end
+    @inbounds for index in eachindex(x)
+        x[index] = Complex{T}(accumulator[index])
     end
     return nothing
 end
