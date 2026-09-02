@@ -525,11 +525,26 @@ end
         @test abs(reorthogonalized_result.iterations - float64_result.iterations) <= 2
         @test norm(reorthogonalized_x - float64_x) / norm(float64_x) < 1.0f-3
 
-        # And the failure they protect against must actually be reachable here,
-        # or the test above proves nothing. Unreorthogonalized Float32 MGS
-        # needs many times the iterations on this system.
+        # The failure the remedies protect against should be reachable here, or
+        # the agreement assertions above are weak. But whether a Float32
+        # recurrence loses orthogonality on a given system is a property of the
+        # *host's* floating point, not of the code under test: this system
+        # degrades 20x on an M1 Max and reportedly not at all on a Ryzen 7
+        # 5825U. Failing there would report a microarchitecture, not a defect.
+        #
+        # So this warns rather than asserts. The agreement between the three
+        # remedies stays a hard assertion; what is conditional is only how much
+        # that agreement proves on this particular machine. The hard version of
+        # this guard lives in scripts/validate_gmres_burton_miller.jl, against a
+        # real operator, where the margin is 1000 iterations against 51.
         stalled_result, _ = run(ComplexF32, :never)
-        @test stalled_result.iterations > 4 * float64_result.iterations
+        if stalled_result.iterations <= 4 * float64_result.iterations
+            @warn "Unreorthogonalized Float32 MGS did not degrade on this host, so " *
+                  "the Krylov agreement assertions above are weaker here than intended." *
+                  " single MGS: $(stalled_result.iterations) iterations, " *
+                  "Float64: $(float64_result.iterations)."
+        end
+        @test stalled_result.iterations >= float64_result.iterations
 
         # A converging solver does not care what the restart is, as long as the
         # restart exceeds the count it converges in. An iteration count that
