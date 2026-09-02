@@ -361,10 +361,15 @@ Compiling the numerical kernels ahead of time does not produce the same
 machine code as compiling them on first call, so a bundled worker's results
 differ from the pre-bundle path in the last bits. Measured on the CPU backend
 over the ATH ladder A1-A5 at 500, 2000 and 6000 Hz: SPL agrees to 2.0e-5 dB
-and pressures to about one Float32 ulp (6.5e-9 of peak). For scale, the Metal
-backend's atomics make it non-reproducible run-to-run at roughly 8e-7, two
-orders of magnitude larger, and the solver emits Float32 — 1e-5 dB is the last
-digit of the output format.
+and pressures to about one Float32 ulp (6.5e-9 of peak). The solver emits
+Float32, so 1e-5 dB is the last digit of the output format.
+
+On Metal the comparison answers itself. Over A1 and A3 at 500 and 2000 Hz the
+bundled worker differs from the pre-bundle one by at most 1.6e-5 dB, and the
+pre-bundle worker differs *from itself between two runs* by 2.0e-5 dB — the
+backend's atomics are not run-to-run reproducible, and that noise floor is
+larger than the effect being measured. On the backend that ships, this change
+is not distinguishable from running the old code twice.
 
 It is not zero, though, so `BLAB_BEAT_ENGINE_BUNDLE=0` forces the include
 fallback, which is bit-identical to the pre-bundle path (verified over the
