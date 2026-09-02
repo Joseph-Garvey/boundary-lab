@@ -474,6 +474,41 @@ function pressure_for_drives(
     return pressure, q_neumann
 end
 
+# Every channel's Neumann vector, one column per channel.
+#
+# The fused Burton-Miller path folds the right-hand side in during assembly, so
+# the drive patterns have to be known before it runs. They are:
+# `channel_unit_drives` depends only on which radiators belong to a channel,
+# and the frequency enters solely through the i*rho*omega scale, so one pass
+# builds every channel's column for a frequency.
+function channel_neumann_columns(mesh, element_mesh_ids, radiators, channel_names, rho, omega, ::Type{T}) where {T<:AbstractFloat}
+    columns = zeros(Complex{T}, length(mesh.faces), length(channel_names))
+    for (channel_index, channel_name) in enumerate(channel_names)
+        unit_drives = channel_unit_drives(radiators, channel_name, T)
+        for (radiator_index, radiator) in enumerate(radiators)
+            drive = unit_drives[radiator_index]
+            drive == zero(Complex{T}) && continue
+            tag = Int(radiator["tag"])
+            for element_index in eachindex(mesh.physical_tags)
+                if mesh.physical_tags[element_index] == tag && radiator_owns_element(radiator, element_mesh_ids, element_index)
+                    columns[element_index, channel_index] = Complex{T}(0, rho * omega) * drive
+                end
+            end
+        end
+    end
+    return columns
+end
+
+function release_assembly_payload!(payload)
+    payload === nothing && return nothing
+    if get(payload, :kind, :operators) === :fused
+        get(payload.system, :on_gpu, false) && release_metal_burton_miller_system!(payload.system)
+        return nothing
+    end
+    release_operator_storage!(payload.operators)
+    return nothing
+end
+
 function field_for_points(points, mesh, pressure, q_neumann, k, field_cache, beat_backend::Symbol)
     if beat_backend == :cuda
         return evaluate_galerkin_field_cuda(points, mesh, pressure, q_neumann, k, field_cache)
@@ -766,10 +801,21 @@ function solve_request_impl(request)
     flat_target = Bool(get_value(config, "flat_target_normalization_enabled", true))
     flat_target_reference_angle_deg = FloatType(get_value(config, "flat_target_reference_angle_deg", 0.0))
     channel_names = sort(unique([String(get_value(radiator, "channel", "main")) for radiator in radiators]))
+    # The fused Burton-Miller path assembles the system matrix and every
+    # channel's right-hand side directly, never the four operators. It is
+    # exterior-only by construction: the coupled FEM/LEM solver is a separate
+    # code path that still needs S, K', D and H individually. Metal's
+    # host-staged fallback assembles on the CPU into four operators, and the
+    # host singular mode has no fused counterpart, so both stay unfused.
+    fused_burton_miller = beat_backend in (:cpu, :metal) &&
+        get(ENV, "BLAB_BEAT_FUSED_BM", "1") != "0" &&
+        (beat_backend != :metal || (metal_assembly_mode != :host_staged &&
+            BeatEngineCore._normalized_metal_singular_mode() == :native))
     singular_cache = build_singular_correction_cache(mesh, singular_order)
     device_cache = nothing
     device_singular_cache = nothing
     device_image_singular_cache = nothing
+    metal_fused_identity_cache = nothing
     cuda_solve_identity_cache = nothing
     rocm_solve_identity_cache = nothing
     field_cache = cpu_field_cache
@@ -838,6 +884,9 @@ function solve_request_impl(request)
         if metal_assembly_mode != :host_staged
             device_singular_cache = build_metal_singular_correction_cache(singular_cache)
         end
+        if fused_burton_miller
+            metal_fused_identity_cache = build_metal_fused_identity_cache(identity_p1_p1, identity_p1_dp0, FloatType)
+        end
     else
         emit_event(
             "status";
@@ -857,6 +906,26 @@ function solve_request_impl(request)
         get(ENV, "BLAB_METAL_PIPELINE", "1") != "0"
     assemble_for_frequency = function (k_value)
         started = time()
+        if fused_burton_miller
+            q_columns = channel_neumann_columns(
+                mesh, element_mesh_ids, radiators, channel_names, rho, k_value * sound_speed, FloatType,
+            )
+            system = assemble_burton_miller_neumann_system_metal(
+                mesh,
+                p1_space,
+                dp0_space,
+                q_columns,
+                k_value,
+                rule;
+                device_cache=device_cache,
+                singular_cache=singular_cache,
+                device_singular_cache=device_singular_cache,
+                identity_cache=metal_fused_identity_cache,
+                singular_order=singular_order,
+                symmetry_mode=Symbol(symmetry_mode),
+            )
+            return ((kind=:fused, system=system, q_columns=q_columns), time() - started)
+        end
         assembled = assemble_regular_galerkin_operators(
             mesh,
             p1_space,
@@ -874,7 +943,7 @@ function solve_request_impl(request)
             metal_assembly_mode=metal_assembly_mode,
             symmetry_mode=Symbol(symmetry_mode),
         )
-        return (assembled, time() - started)
+        return ((kind=:operators, operators=assembled), time() - started)
     end
     pending_assembly = nothing
     if metal_pipeline && !isempty(frequencies)
@@ -885,7 +954,7 @@ function solve_request_impl(request)
     try
         for (index, freq_raw) in enumerate(frequencies)
             if cancel_path !== nothing && isfile(String(cancel_path))
-                pending_assembly === nothing || release_operator_storage!(fetch(pending_assembly)[1])
+                pending_assembly === nothing || release_assembly_payload!(fetch(pending_assembly)[1])
                 emit_event("cancelled"; solved_count=index - 1)
                 return
             end
@@ -936,14 +1005,39 @@ function solve_request_impl(request)
                 # immediately queue the next frequency's assembly behind it.
                 # The reported assembly time is the worker's own, even though
                 # it overlapped the previous frequency's solve.
-                operators, pipelined_assembly_seconds = fetch(pending_assembly)
+                assembly_payload, pipelined_assembly_seconds = fetch(pending_assembly)
                 pending_assembly = nothing
                 if index < length(frequencies)
                     next_k = FloatType(2pi) * FloatType(frequencies[index + 1]) / sound_speed
                     pending_assembly = Threads.@spawn assemble_for_frequency(next_k)
                 end
+            elseif fused_burton_miller
+                fused_q_columns = channel_neumann_columns(
+                    mesh, element_mesh_ids, radiators, channel_names, rho, omega, FloatType,
+                )
+                fused_system = beat_backend == :metal ?
+                    assemble_burton_miller_neumann_system_metal(
+                        mesh, p1_space, dp0_space, fused_q_columns, k, selected_rule;
+                        device_cache=device_cache,
+                        singular_cache=singular_cache,
+                        device_singular_cache=device_singular_cache,
+                        identity_cache=metal_fused_identity_cache,
+                        singular_order=singular_order,
+                        symmetry_mode=Symbol(symmetry_mode),
+                    ) :
+                    assemble_burton_miller_neumann_system_cpu(
+                        mesh, p1_space, dp0_space, fused_q_columns, k, selected_rule;
+                        identity_p1_p1=selected_identity_p1_p1,
+                        identity_p1_dp0=selected_identity_p1_dp0,
+                        skip_singular=false,
+                        singular_order=singular_order,
+                        singular_cache=singular_cache,
+                        cpu_cache=selected_cpu_assembly_cache,
+                        symmetry_mode=Symbol(symmetry_mode),
+                    )
+                assembly_payload = (kind=:fused, system=fused_system, q_columns=fused_q_columns)
             else
-                operators = assemble_regular_galerkin_operators(
+                assembly_payload = (kind=:operators, operators=assemble_regular_galerkin_operators(
                     mesh,
                     p1_space,
                     dp0_space,
@@ -962,15 +1056,25 @@ function solve_request_impl(request)
                     rocm_assembly_mode=rocm_assembly_mode,
                     metal_assembly_mode=metal_assembly_mode,
                     symmetry_mode=Symbol(symmetry_mode),
-                )
+                ))
             end
         end
         metal_pipeline && (t_assembly = pipelined_assembly_seconds)
+        operators = get(assembly_payload, :operators, nothing)
 
         t_solve = 0.0
         t_field = 0.0
         cpu_solve_system = nothing
-        if beat_backend == :cpu
+        fused_pressure = nothing
+        if assembly_payload.kind === :fused
+            # One factorization per frequency, every channel solved against it,
+            # exactly as the four-operator path reuses its factorization.
+            t_solve += @elapsed begin
+                fused_pressure = beat_backend == :metal ?
+                    solve_metal_burton_miller_system(assembly_payload.system) :
+                    solve_burton_miller_neumann_system_cpu(assembly_payload.system)
+            end
+        elseif beat_backend == :cpu
             t_solve += @elapsed begin
                 cpu_solve_system = build_burton_miller_neumann_cpu_system(operators, selected_identity_p1_p1, selected_identity_p1_dp0, k)
             end
@@ -993,26 +1097,31 @@ function solve_request_impl(request)
         horizontal_count = length(horizontal_points)
         vertical_count = length(vertical_points)
 
-        for channel_name in channel_names
-            unit_drives = channel_unit_drives(radiators, channel_name, FloatType)
+        for (channel_index, channel_name) in enumerate(channel_names)
             pressure = nothing
             q_neumann = nothing
-            t_solve += @elapsed begin
-                pressure, q_neumann = pressure_for_drives(
-                    mesh,
-                    element_mesh_ids,
-                    operators,
-                    selected_identity_p1_p1,
-                    selected_identity_p1_dp0,
-                    radiators,
-                    unit_drives,
-                    rho,
-                    omega,
-                    k,
-                    cpu_solve_system=cpu_solve_system,
-                    cuda_solve_identity_cache=cuda_solve_identity_cache,
-                    rocm_solve_identity_cache=rocm_solve_identity_cache,
-                )
+            if assembly_payload.kind === :fused
+                pressure = Complex{FloatType}.(fused_pressure[:, channel_index])
+                q_neumann = assembly_payload.q_columns[:, channel_index]
+            else
+                unit_drives = channel_unit_drives(radiators, channel_name, FloatType)
+                t_solve += @elapsed begin
+                    pressure, q_neumann = pressure_for_drives(
+                        mesh,
+                        element_mesh_ids,
+                        operators,
+                        selected_identity_p1_p1,
+                        selected_identity_p1_dp0,
+                        radiators,
+                        unit_drives,
+                        rho,
+                        omega,
+                        k,
+                        cpu_solve_system=cpu_solve_system,
+                        cuda_solve_identity_cache=cuda_solve_identity_cache,
+                        rocm_solve_identity_cache=rocm_solve_identity_cache,
+                    )
+                end
             end
             t_field += @elapsed begin
                 combined_pressure = field_for_points(combined_points, mesh, pressure, q_neumann, k, selected_field_cache, beat_backend)
@@ -1060,7 +1169,7 @@ function solve_request_impl(request)
             impedance = impedance_for_radiators(mesh, element_mesh_ids, mixed_boundary_pressure, radiators, drives, FloatType; symmetry_mode=Symbol(symmetry_mode))
         end
 
-        release_operator_storage!(operators)
+        release_assembly_payload!(assembly_payload)
         emit_event(
             "result";
             solved_count=index,
@@ -1087,7 +1196,9 @@ function solve_request_impl(request)
                     "message" => "Julia direct dense solve",
                     "backend" => String(beat_backend),
                     "symmetry" => symmetry_mode,
-                    "regular_assembly_mode" => string(get(operators, :regular_assembly_mode, beat_backend == :cuda ? :serial_pair_batched : Symbol("$(beat_backend)_default"))),
+                    "regular_assembly_mode" => string(assembly_payload.kind === :fused ?
+                        assembly_payload.system.assembly_mode :
+                        get(operators, :regular_assembly_mode, beat_backend == :cuda ? :serial_pair_batched : Symbol("$(beat_backend)_default"))),
                     "blas_threads" => cpu_blas_threads,
                     "regular_quadrature_mode" => regular_quadrature_mode,
                     "regular_quadrature_order" => quadrature_selection.order,
@@ -1105,7 +1216,7 @@ function solve_request_impl(request)
     finally
         if pending_assembly !== nothing
             try
-                release_operator_storage!(fetch(pending_assembly)[1])
+                release_assembly_payload!(fetch(pending_assembly)[1])
             catch
             end
         end
@@ -1129,6 +1240,9 @@ function solve_request_impl(request)
         end
         if beat_backend == :metal && device_singular_cache !== nothing
             release_metal_singular_correction_cache!(device_singular_cache)
+        end
+        if beat_backend == :metal && metal_fused_identity_cache !== nothing
+            release_metal_fused_identity_cache!(metal_fused_identity_cache)
         end
         if beat_backend == :metal && device_cache !== nothing
             release_metal_regular_assembly_cache!(device_cache)

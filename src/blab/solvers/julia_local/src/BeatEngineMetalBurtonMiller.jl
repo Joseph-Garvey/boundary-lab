@@ -139,6 +139,132 @@ end
     return lhs_re, lhs_im, rhs_re, rhs_im
 end
 
+# The pair's Burton-Miller contribution, combined inside the accumulation
+# rather than after it.
+#
+# The per-quadrature-point-pair arithmetic cannot drop: D and H carry different
+# geometric prefactors per entry (D is basis_product * grad * trial_dot, H is
+# curl - k^2 * basis_product * n.n' against the Green's value), so both terms
+# are evaluated whatever they are accumulated into. Same for S against K'.
+#
+# The rank-1 *outer products* are a different matter. `_metal_regular_pair_blocks`
+# accumulates four 3-vectors per test point and then expands each into its own
+# 3x3 block, four expansions per test point. The Burton-Miller combination is
+# linear, so it can be applied to the 3-vectors *before* the expansion, leaving
+# one 3x3 expansion instead of two and one 3x1 instead of two. That halves the
+# outer-product work and the live 3x3 accumulators, 48 floats to 24.
+#
+# The hypersingular curl term is not inside the test loop at all: H is
+# curl_products * G0 - k^2 (n.n') * (basis-weighted sums), and only the second
+# half accumulates per test point. The first half is added once after the loop.
+@inline function _metal_regular_pair_fused_blocks(
+    face_vertices,
+    normals,
+    areas,
+    curls,
+    rule_points,
+    rule_weights,
+    element_rule_points,
+    test_index::Int32,
+    trial_index::Int32,
+    face_count::Int32,
+    k,
+    inverse_k,
+    ::Val{R},
+    trial_sign_x,
+    trial_sign_y,
+    trial_sign_z,
+    trial_curl_sign_x,
+    trial_curl_sign_y,
+    trial_curl_sign_z,
+) where {R}
+    T = typeof(k)
+    inv_four_pi = T(0.07957747154594767)
+    @inbounds begin
+    lhs_re = zero(SVector{9,T})
+    lhs_im = zero(SVector{9,T})
+    rhs_re = zero(SVector{3,T})
+    rhs_im = zero(SVector{3,T})
+    test_nx = normals[test_index]
+    test_ny = normals[test_index + face_count]
+    test_nz = normals[test_index + Int32(2) * face_count]
+    trial_nx = trial_sign_x * normals[trial_index]
+    trial_ny = trial_sign_y * normals[trial_index + face_count]
+    trial_nz = trial_sign_z * normals[trial_index + Int32(2) * face_count]
+    normal_product = test_nx * trial_nx + test_ny * trial_ny + test_nz * trial_nz
+    jac_scale = T(4) * areas[test_index] * areas[trial_index]
+    trial_signs = SVector(trial_sign_x, trial_sign_y, trial_sign_z)
+    # -(i/k) * k^2 (n.n'), folded into the per-test-point combination.
+    curl_scale = inverse_k * k * k * normal_product
+
+    g_total_re = zero(k)
+    g_total_im = zero(k)
+    test_q = Int32(1)
+    while test_q <= Int32(R)
+        test_xi = rule_points[test_q]
+        test_eta = rule_points[test_q + Int32(R)]
+        tb1 = one(k) - test_xi - test_eta
+        tb2 = test_xi
+        tb3 = test_eta
+        test_basis = SVector(tb1, tb2, tb3)
+        point_index = test_index + face_count * (test_q - Int32(1))
+        x = element_rule_points[point_index]
+        y = element_rule_points[point_index + face_count * Int32(R)]
+        z = element_rule_points[point_index + face_count * Int32(2 * R)]
+        test_weight = rule_weights[test_q]
+
+        s_re = zero(k)
+        s_im = zero(k)
+        a_re = zero(k)
+        a_im = zero(k)
+        d_re = zero(SVector{3,T})
+        d_im = zero(SVector{3,T})
+        h_re = zero(SVector{3,T})
+        h_im = zero(SVector{3,T})
+        context = (x, y, z, test_weight * jac_scale, k, inv_four_pi,
+            test_nx, test_ny, test_nz, trial_nx, trial_ny, trial_nz, trial_signs,
+            element_rule_points, rule_points, rule_weights, trial_index, face_count)
+        s_re, s_im, a_re, a_im, d_re, d_im, h_re, h_im = _metal_trial_fold(
+            (s_re, s_im, a_re, a_im, d_re, d_im, h_re, h_im),
+            context, Val(R), Val(R),
+        )
+        # rhs coefficient: -S - (i/k) K'
+        rhs_re += test_basis * (-s_re + inverse_k * a_im)
+        rhs_im += test_basis * (-s_im - inverse_k * a_re)
+        g_total_re += s_re
+        g_total_im += s_im
+        # lhs: -D + (i/k) H, less the curl term added after the loop.
+        u_re = -d_re + curl_scale * h_im
+        u_im = -d_im - curl_scale * h_re
+        lhs_re += SVector(
+            tb1 * u_re[1], tb2 * u_re[1], tb3 * u_re[1],
+            tb1 * u_re[2], tb2 * u_re[2], tb3 * u_re[2],
+            tb1 * u_re[3], tb2 * u_re[3], tb3 * u_re[3],
+        )
+        lhs_im += SVector(
+            tb1 * u_im[1], tb2 * u_im[1], tb3 * u_im[1],
+            tb1 * u_im[2], tb2 * u_im[2], tb3 * u_im[2],
+            tb1 * u_im[3], tb2 * u_im[3], tb3 * u_im[3],
+        )
+        test_q += Int32(1)
+    end
+    # (i/k) * curl_products * G0, computed after the loop so its nine values are
+    # not live registers during it.
+    curl_products = _metal_pair_curl_products(
+        curls,
+        test_index,
+        trial_index,
+        face_count,
+        trial_curl_sign_x,
+        trial_curl_sign_y,
+        trial_curl_sign_z,
+    )
+    lhs_re -= curl_products * (inverse_k * g_total_im)
+    lhs_im += curl_products * (inverse_k * g_total_re)
+    return lhs_re, lhs_im, rhs_re, rhs_im
+    end
+end
+
 function _metal_fused_pair_blocks_kernel!(
     blocks,
     face_vertices,
@@ -191,7 +317,7 @@ function _metal_fused_pair_blocks_kernel!(
         end
         return nothing
     end
-    slp_re, slp_im, adj_re, adj_im, dlp_re, dlp_im, hyp_re, hyp_im = _metal_regular_pair_blocks(
+    lhs_re, lhs_im, rhs_re, rhs_im = _metal_regular_pair_fused_blocks(
         face_vertices,
         normals,
         areas,
@@ -203,6 +329,7 @@ function _metal_fused_pair_blocks_kernel!(
         trial_index,
         face_count,
         k,
+        inverse_k,
         Val(R),
         trial_sign_x,
         trial_sign_y,
@@ -210,9 +337,6 @@ function _metal_fused_pair_blocks_kernel!(
         trial_curl_sign_x,
         trial_curl_sign_y,
         trial_curl_sign_z,
-    )
-    lhs_re, lhs_im, rhs_re, rhs_im = _metal_fused_pair_combination(
-        slp_re, slp_im, adj_re, adj_im, dlp_re, dlp_im, hyp_re, hyp_im, inverse_k,
     )
     _metal_store_block!(blocks, base, pair_stride, Int32(0), lhs_re)
     _metal_store_block!(blocks, base, pair_stride, Int32(9), lhs_im)
