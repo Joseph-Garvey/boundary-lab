@@ -117,7 +117,7 @@ const WORKLOAD_MESH = """
                 "rho" => 1.2041,
                 "sound_speed" => 343.0,
                 "symmetry" => "off",
-                "source_motion" => "piston",
+                "source_motion" => "normal",
             ),
         )
         redirect_stdout(devnull) do
