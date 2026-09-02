@@ -42,31 +42,85 @@ function configure_beat_cpu_blas_threads!(
     return BLAS.get_num_threads()
 end
 
+"""
+    burton_miller_neumann_lhs(operators, identity_p1_p1, k)
+
+`0.5 M - D + (i/k) H` as one fused broadcast.
+
+The real identity block is broadcast directly against the complex operators
+rather than promoted first: `Complex{T}.(identity_p1_p1)` materialised a full
+N x N complex copy of a matrix that is 99.9% zeros -- 419 MB at 10,230 P1 dofs,
+every frequency.
+"""
+function burton_miller_neumann_lhs(operators, identity_p1_p1, k::T) where {T<:AbstractFloat}
+    coupling = Complex{T}(0, 1) / k
+    return Complex{T}(0.5) .* identity_p1_p1 .- operators.double_layer .+ coupling .* operators.hypersingular
+end
+
+"""
+    burton_miller_neumann_rhs(operators, identity_p1_dp0, q_neumann, k)
+
+`(-S - (i/k)(K' + 0.5 M_p1dp0)) q` without ever forming that operator.
+
+The materialised form is N x 2N complex -- 1.67 GB at 10,230 P1 dofs -- built
+once per frequency only to be multiplied by a vector. Three matrix-vector
+products cost a fraction of writing it. This mirrors what the CUDA path already
+does above 768 dofs (`_cuda_burton_miller_rhs`).
+"""
+function burton_miller_neumann_rhs(operators, identity_p1_dp0, q_neumann, k::T) where {T<:AbstractFloat}
+    coupling = Complex{T}(0, 1) / k
+    q = Complex{T}.(q_neumann)
+    rhs = Vector{Complex{T}}(undef, size(operators.single_layer, 1))
+    mul!(rhs, operators.single_layer, q, -one(Complex{T}), zero(Complex{T}))
+    mul!(rhs, operators.adjoint_double_layer, q, -coupling, one(Complex{T}))
+    _add_scaled_matvec!(rhs, identity_p1_dp0, q, -T(0.5) * coupling)
+    return rhs
+end
+
+# rhs .+= alpha .* (matrix * q).  The identity blocks are assembled real, and a
+# real-matrix/complex-vector `mul!` falls off BLAS into a generic loop, so the
+# real case is split into two BLAS gemv calls instead.
+function _add_scaled_matvec!(rhs::Vector{Complex{T}}, matrix::AbstractMatrix{T},
+                             q::Vector{Complex{T}}, alpha::Complex{T}) where {T<:AbstractFloat}
+    real_part = matrix * real.(q)
+    imag_part = matrix * imag.(q)
+    @inbounds for index in eachindex(rhs)
+        rhs[index] += alpha * Complex{T}(real_part[index], imag_part[index])
+    end
+    return rhs
+end
+
+function _add_scaled_matvec!(rhs::Vector{Complex{T}}, matrix::AbstractMatrix{Complex{T}},
+                             q::Vector{Complex{T}}, alpha::Complex{T}) where {T<:AbstractFloat}
+    return mul!(rhs, matrix, q, alpha, one(Complex{T}))
+end
+
+# Fallback for any other element type: correct, just not on a BLAS path.
+function _add_scaled_matvec!(rhs::Vector{Complex{T}}, matrix::AbstractMatrix,
+                             q::Vector{Complex{T}}, alpha::Complex{T}) where {T<:AbstractFloat}
+    rhs .+= alpha .* (matrix * q)
+    return rhs
+end
+
 function burton_miller_neumann_matrices(operators, identity_p1_p1, identity_p1_dp0, k::T) where {T<:AbstractFloat}
     coupling = Complex{T}(0, 1) / k
-    identity_p1_p1_complex = Complex{T}.(identity_p1_p1)
-    identity_p1_dp0_complex = Complex{T}.(identity_p1_dp0)
-
-    lhs = Complex{T}(0.5) .* identity_p1_p1_complex .- operators.double_layer .+ coupling .* operators.hypersingular
-    rhs_operator = -operators.single_layer .- coupling .* (operators.adjoint_double_layer .+ Complex{T}(0.5) .* identity_p1_dp0_complex)
+    lhs = burton_miller_neumann_lhs(operators, identity_p1_p1, k)
+    rhs_operator = -operators.single_layer .- coupling .* (operators.adjoint_double_layer .+ Complex{T}(0.5) .* identity_p1_dp0)
     return lhs, rhs_operator
 end
 
 function build_burton_miller_neumann_cpu_system(operators, identity_p1_p1, identity_p1_dp0, k::T) where {T<:AbstractFloat}
-    lhs, rhs_operator = burton_miller_neumann_matrices(
-        operators,
-        identity_p1_p1,
-        identity_p1_dp0,
-        k,
-    )
     return (
-        factorization=lu!(lhs),
-        rhs_operator=rhs_operator,
+        factorization=lu!(burton_miller_neumann_lhs(operators, identity_p1_p1, k)),
+        single_layer=operators.single_layer,
+        adjoint_double_layer=operators.adjoint_double_layer,
+        identity_p1_dp0=identity_p1_dp0,
+        wavenumber=k,
     )
 end
 
 function solve_burton_miller_neumann_cpu_system(system, q_neumann, ::Type{T}) where {T<:AbstractFloat}
-    rhs = system.rhs_operator * Complex{T}.(q_neumann)
+    rhs = burton_miller_neumann_rhs(system, system.identity_p1_dp0, q_neumann, system.wavenumber)
     return Complex{T}.(system.factorization \ rhs)
 end
 

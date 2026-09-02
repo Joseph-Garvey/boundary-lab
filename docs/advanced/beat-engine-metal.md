@@ -71,6 +71,13 @@ The host arrays alias device memory, so the operator storage is released once,
 through whichever tuple the caller still holds: the host tuple returned by
 `metal_host_operators` owns the buffers it wrapped, and freeing the device
 tuple while those views are still live leaves them dangling.
+The Burton-Miller right-hand side is applied matrix-free. The operator
+`-S - (i/k)(K' + 0.5 M)` is N x 2N complex -- 1.67 GB at 10,230 P1 dofs -- and
+was materialised once per frequency only to be multiplied by a drive vector;
+three matrix-vector products replace it. The left-hand side broadcasts the real
+identity block directly instead of promoting it to a full complex copy. Between
+them these were 0.84-1.16 s of a 6.3-6.7 s solve at 10,230 dofs, and about
+2.5 GB of allocation per frequency.
 
 Four regular-assembly kernel modes exist. The default, `pair_gather`, is
 the chunked pair-gather design described above. It exists because the

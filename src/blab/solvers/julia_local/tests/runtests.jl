@@ -136,6 +136,24 @@ end
     @test all(isfinite, imag.(pressure))
     @test pressure_from_system ≈ pressure rtol=Float32(1e-4) atol=Float32(1e-4)
 
+    # The cached system builds its right-hand side from three matrix-vector
+    # products instead of materialising the N x 2N Burton-Miller right-hand
+    # operator. Pin it against that operator, and pin the fused left-hand side
+    # against the promote-then-broadcast form it replaced.
+    reference_lhs, reference_rhs_operator = burton_miller_neumann_matrices(
+        operators, identity_p1_p1, identity_p1_dp0, k,
+    )
+    coupling = ComplexF32(0, 1) / k
+    promoted_lhs = ComplexF32(0.5) .* ComplexF32.(identity_p1_p1) .- operators.double_layer .+
+                   coupling .* operators.hypersingular
+    @test burton_miller_neumann_lhs(operators, identity_p1_p1, k) == promoted_lhs
+    @test reference_lhs == promoted_lhs
+    @test burton_miller_neumann_rhs(operators, identity_p1_dp0, q_neumann, k) ≈
+          reference_rhs_operator * ComplexF32.(q_neumann) rtol=Float32(1e-5) atol=Float32(1e-6)
+    # A complex identity block takes the BLAS path; it must agree with the real one.
+    @test burton_miller_neumann_rhs(operators, ComplexF32.(identity_p1_dp0), q_neumann, k) ≈
+          reference_rhs_operator * ComplexF32.(q_neumann) rtol=Float32(1e-5) atol=Float32(1e-6)
+
     field_cache = build_field_evaluation_cache(mesh, rule)
     eval_points = fibonacci_sphere(8, Float32(2.0))
     field = evaluate_galerkin_field_cpu(eval_points, mesh, pressure, q_neumann, k, field_cache)
