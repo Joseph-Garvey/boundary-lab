@@ -807,10 +807,14 @@ function solve_request_impl(request)
     # code path that still needs S, K', D and H individually. Metal's
     # host-staged fallback assembles on the CPU into four operators, and the
     # host singular mode has no fused counterpart, so both stay unfused.
+    # The fused path has one regular kernel of its own, so a request for a
+    # specific diagnostic kernel mode has to fall back to the four-operator
+    # path or the request would be silently ignored.
     fused_burton_miller = beat_backend in (:cpu, :metal) &&
         get(ENV, "BLAB_BEAT_FUSED_BM", "1") != "0" &&
         (beat_backend != :metal || (metal_assembly_mode != :host_staged &&
-            BeatEngineCore._normalized_metal_singular_mode() == :native))
+            BeatEngineCore._normalized_metal_singular_mode() == :native &&
+            BeatEngineCore._normalized_metal_regular_kernel_mode() == :pair_gather))
     singular_cache = build_singular_correction_cache(mesh, singular_order)
     device_cache = nothing
     device_singular_cache = nothing
