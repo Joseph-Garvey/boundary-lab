@@ -20,6 +20,12 @@ Core](beat-engine-core.md) for the shared boundary-integral formulation.
 
 ## Execution model
 
+Exterior solves take the fused Burton-Miller path described below, which never
+forms the four operators. The four-operator path described here is still what
+coupled FEM-BEM-LEM solves, the `host_staged` assembly fallback and the `host`
+singular mode use, and `BLAB_BEAT_FUSED_BM=0` selects it for exterior solves
+too.
+
 Boundary Lab prepares mesh topology, quadrature rules, symmetry transforms, and
 frequency-independent cache data on the CPU. The Metal worker then:
 
@@ -71,6 +77,37 @@ The host arrays alias device memory, so the operator storage is released once,
 through whichever tuple the caller still holds: the host tuple returned by
 `metal_host_operators` owns the buffers it wrapped, and freeing the device
 tuple while those views are still live leaves them dangling.
+### Fused Burton-Miller assembly (exterior solves)
+
+The coupling eta = i/k is known at assembly time, so the exterior path forms
+
+    lhs = 0.5 M_p1p1 - D + (i/k) H          rhs = (-S - (i/k)(K' + 0.5 M_p1dp0)) q
+
+inside the assembly kernels and never allocates S, K', D or H. That is one
+N x N matrix and one right-hand side per drive instead of 6N^2 complex entries,
+a measured **6.0x** reduction in operator memory on every mesh tried, and
+because the storage is O(N^2) it is sqrt(6) ~ 2.45x more dofs at the same peak.
+
+Every channel's Neumann column is built before assembly and folded in during
+the same pass, so one assembly still serves the whole channel set at a
+frequency exactly as one factorization does.
+
+The win is *not* the halved stores. The combination is applied to the pair's
+3-vectors before the rank-1 expansion, not to four finished blocks afterwards:
+one 3x3 expansion per test point instead of two, one 3x1 instead of two, and 24
+live accumulator floats instead of 48. Measured on the pair kernel alone,
+combining afterwards is 1.00-1.02x and combining before the expansion is
+1.82-1.87x. Whole assembly is 2.12-2.77x faster over the ATH ladder from 1,974
+to 10,230 dofs. The per-quadrature-point arithmetic is unchanged and cannot
+change: D and H carry different geometric prefactors per entry, so both terms
+are evaluated whatever they accumulate into. Only the expansion collapses, and
+only because the hypersingular curl term carries no basis product and can be
+summed as one scalar and expanded after the loop.
+
+`scripts/validate_metal_fused_burton_miller.jl` gates it by comparing the fused
+system against the four-operator system on the same mesh, frequency and
+quadrature, where the two differ only by float32 summation order.
+
 The Burton-Miller right-hand side is applied matrix-free. The operator
 `-S - (i/k)(K' + 0.5 M)` is N x 2N complex -- 1.67 GB at 10,230 P1 dofs -- and
 was materialised once per frequency only to be multiplied by a drive vector;
@@ -166,6 +203,7 @@ Normal application use does not require these environment variables.
 | `BLAB_METAL_OPERATOR_STORAGE` | `shared` | Use `private` to allocate the operator matrices in private storage and copy them to the host, the pre-2026-09-02 behavior. |
 | `BLAB_METAL_PIPELINE` | `1` | Set to `0` to assemble and solve each sweep frequency sequentially instead of overlapping GPU assembly with the CPU factorization. |
 | `BLAB_METAL_ATOMIC_SCATTER` | `1` | Diagnostic for `pair_atomic` only: `0` skips the atomic scatter to time the pair arithmetic (the operators are then wrong). |
+| `BLAB_BEAT_FUSED_BM` | `1` | Set to `0` to assemble the four operators and combine them on the host for exterior solves. Coupled solves, `host_staged` assembly and the `host` singular mode always take the four-operator path. |
 
 ## Verification
 
@@ -173,6 +211,7 @@ CPU-versus-Metal validation scripts:
 
 | Script | Coverage |
 |---|---|
+| `validate_metal_fused_burton_miller.jl` | Fused exterior system against the four-operator system, symmetry off/x/xy, multi-drive |
 | `validate_metal_exterior.jl` | Operators (both singular modes), boundary pressure, residual, and exterior field for an exterior solve. |
 | `validate_metal_symmetry.jl` | X and XY reduced-domain assembly and solve parity, both singular modes. |
 | `validate_metal_coupled.jl` | Coupled FEM-BEM-LEM assembly, condensation, solution, and field for the monolithic and condensed paths, prescribed-velocity and voltage excitations. |

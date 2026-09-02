@@ -22,6 +22,21 @@ For each frequency, the CPU path:
 5. Solves through Julia's dense BLAS/LAPACK path.
 6. Evaluates requested polar and spherical fields on the CPU.
 
+Steps 2 to 4 are the four-operator path. Exterior solves take a fused path
+instead (`BeatEngineCpuBurtonMiller.jl`): the coupling `eta = i/k` is known at
+assembly time, so `0.5 M - D + (i/k) H` and `(-S - (i/k)(K' + 0.5 M)) q` are
+formed per quadrature point pair and only the N x N system matrix and one
+right-hand side per drive are ever allocated, instead of 6N^2 complex entries.
+Assembly is 1.34-1.38x faster on the ATH reference meshes and the operator
+memory drops 6x. Every channel's Neumann column is folded in during the same
+pass, so one assembly still serves the whole channel set at a frequency.
+
+The four-operator path is unchanged and is what coupled FEM-BEM-LEM solves use;
+`BLAB_BEAT_FUSED_BM=0` selects it for exterior solves too. The
+`cpu fused Burton-Miller equals the four-operator path` testset in
+`tests/runtests.jl` gates the two against each other on the same mesh,
+frequency and quadrature over symmetry off, x and xy.
+
 The CPU implementation lives under `src/blab/solvers/julia_local/src/BeatEngineCpu*.jl`.
 
 ## CPU Operator Assembly
@@ -135,5 +150,6 @@ Example comparison:
 - `src/blab/solvers/julia_local/src/BeatEngineCpu.jl`: include hub for the CPU implementation files.
 - `src/blab/solvers/julia_local/src/BeatEngineCpuAssembly.jl`: CPU Galerkin operator assembly entry point.
 - `src/blab/solvers/julia_local/src/BeatEngineCpuField.jl`: CPU field-evaluation path.
+- `src/blab/solvers/julia_local/src/BeatEngineCpuBurtonMiller.jl`: fused CPU Burton-Miller assembly for exterior solves.
 - `src/blab/solvers/julia_local/src/BeatEngineCpuSolve.jl`: CPU Burton-Miller dense solve through Julia's LAPACK/BLAS path.
 - `src/blab/solvers/julia_local/solver.jl`: CPU backend dispatch, wavelength quadrature selection, per-order caches, and result diagnostics.
