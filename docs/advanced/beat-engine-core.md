@@ -297,11 +297,34 @@ A worker process must load and compile the engine before it can solve
 anything, and until the bundle packages existed it did all of that from
 source. `solver.jl` `include`d 20,700 lines of engine and carried 1,300 lines
 of driver itself, and Julia caches native code only for packages — so neither
-the pkgimage cache nor the sysimage in `docker/` could see any of it. Measured
-on an M1 Max, spawn to worker-ready was 12-14 s, of which roughly 11 s was the
-engine load and the larger remaining part was compiling the worker's own entry
-path. Against a three-frequency A3 sweep that does about 1.8 s of real work,
-the start-up was several times the compute.
+the pkgimage cache nor the sysimage in `docker/` could see any of it. Against a
+three-frequency A3 sweep that does about 1.8 s of real work, the start-up was
+several times the compute.
+
+Measured on an M1 Max, A1 (1,974 dofs), one frequency, arms interleaved so both
+see the same machine, and only samples with no other Julia running counted:
+
+| | before | after |
+|---|---|---|
+| bare Julia start-up | 0.09 s | 0.09 s |
+| spawn to worker-ready | 10.0-10.6 s | 3.33-3.51 s |
+| request to initialized | 2.9-3.2 s | 1.34-1.49 s |
+| first solve, CPU | 5.8-6.3 s | 1.75-1.87 s |
+| **time to first result, CPU** | **18.8-20.0 s** | **6.5-6.8 s** |
+| **time to first result, Metal** | **28.9-30.0 s** | **16.3-17.3 s** |
+| second solve, same worker | 1.46-1.61 s | 1.44-1.60 s |
+
+The last row is the control: a warm solve is unchanged, which is what says this
+is start-up and not the solver.
+
+Subtracting the warm solve from the first one isolates what a first solve pays
+on top. On the CPU backend that is 4.4 s before and 0.3 s after — Julia JIT,
+which the precompile workload removes. The same subtraction on Metal leaves
+about 11 s in *both* arms. That residual is GPU kernel compilation, and
+GPUCompiler has no disk cache, so no sysimage or pkgimage can hold it. Keeping
+a worker process alive between solves is the only remedy for that component,
+which makes the persistent worker in the Python adapter load-bearing rather
+than an optimisation.
 
 The sources now live in packages, one per accelerator, under `julia_engine/`.
 Each bundle `include`s the same engine and driver files and carries a
