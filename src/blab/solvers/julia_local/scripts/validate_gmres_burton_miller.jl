@@ -122,11 +122,23 @@ function validate_gmres_burton_miller()
     check(!report.fell_back, "$(frequency_hz) Hz: GMRES fell back to the LU on the default path")
     check(agreement <= agreement_tolerance,
           "$(frequency_hz) Hz: GMRES disagrees with the LU by $(agreement), above $(agreement_tolerance)")
+    # Recomputed independently of the solver, which evaluates `b - Ax` as one
+    # fused gemv accumulating into b. Forming `Ax` in full and subtracting
+    # afterwards cancels, and in Float32 that costs about sqrt(N) * eps of the
+    # result -- 1.1e-5 at 7,890 dofs, above the 1e-6 the solver is asked for.
+    # So the bound is the larger of the tolerance and that evaluation floor:
+    # below the floor this quantity is measuring Float32 subtraction, not the
+    # solve. The solver's own fused evaluation is the more accurate of the two,
+    # and the check that the answer is actually right is the agreement with the
+    # LU above, not this one.
+    evaluation_floor = sqrt(Float64(n)) * eps(Float32)
+    residual_bound = max(4 * tolerance, evaluation_floor)
     for drive in 1:drive_count
         residual = norm(matrix * view(gmres_solution, :, drive) - view(rhs, :, drive)) /
             max(norm(view(rhs, :, drive)), eps(Float32))
-        check(residual <= 4 * tolerance,
-              "$(frequency_hz) Hz drive $drive: true relative residual $(residual) exceeds 4x the tolerance")
+        check(residual <= residual_bound,
+              "$(frequency_hz) Hz drive $drive: recomputed relative residual $(residual) " *
+              "exceeds $(residual_bound) (4x tolerance, or the Float32 evaluation floor)")
     end
 
     # The routing decision itself must be reported, not silently taken.
