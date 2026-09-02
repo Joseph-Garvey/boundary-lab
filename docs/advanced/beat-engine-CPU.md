@@ -124,6 +124,15 @@ The CPU backend selects the BLAS thread count from the P1 unknown count:
 Set `BLAB_BEAT_CPU_BLAS_THREADS` to `auto` or a positive integer to override
 the policy. Explicit values are capped at the Julia thread count.
 
+## Adaptive Dense Solve
+
+Exterior solves on the fused path choose between the dense LU and a
+diagonally preconditioned GMRES per solve, in
+`src/blab/solvers/julia_local/src/BeatEngineDenseSolve.jl`. See
+[BEAT Engine Core](beat-engine-core.md#adaptive-dense-solve) for the cost
+model, the calibration constants and the environment overrides; the routing
+code is backend-independent and both the CPU and Metal fused paths call it.
+
 ## CPU Benchmark And Comparison Scripts
 
 Useful scripts:

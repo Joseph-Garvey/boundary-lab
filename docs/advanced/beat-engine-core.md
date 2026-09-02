@@ -189,6 +189,92 @@ frequency-invariant result domains and are not repeated in each streamed
 frequency result. The Python decoder continues to accept schema version 1
 real/imaginary decimal arrays for compatibility with older workers.
 
+## Adaptive Dense Solve
+
+Exterior solves on the fused Burton-Miller path get one `N x N` system matrix
+and an `N x drives` right-hand side, and there are two reasonable ways to solve
+that. `BeatEngineDenseSolve.jl` chooses per solve.
+
+- **Dense LU.** `(8/3)N^3` for the factorization, then one triangular solve per
+  drive. One factorization serves every channel, which the CPU and Metal
+  backends are deliberately built around.
+- **GMRES, diagonal preconditioning.** One dense matvec per iteration, per
+  drive, with no factorization to share.
+
+The LU is `O(N^3)` and GMRES is `O(N^2)`, so they cross in the problem size;
+the LU amortises across drives and GMRES does not, so they cross the other way
+in the drive count. The router therefore compares the two costs directly rather
+than testing a dof threshold:
+
+    choose GMRES when   drives * t_gmres(N)  <  T_fact(N) + drives * t_tri(N)
+
+A pair of independent thresholds — "above N dofs and below D drives" — would be
+wrong, because the drive crossover moves with N. It would route a three-way
+design to the slower path at exactly the size where the dof test says GMRES
+wins.
+
+### Calibration, and why it is not a constant
+
+Four measured constants sit behind that comparison: the LU's effective GFLOP/s,
+two terms of a matvec model `t = a N^2 + b N`, and the triangular solve's
+bandwidth. The linear matvec term is not decoration — the effective bandwidth
+of a dense complex matvec is still rising across the useful size range, so
+fitting `iterations * 8N^2 / bandwidth` with a single bandwidth constant
+misplaces the crossover at both ends.
+
+The shipped values are measured on one machine, and every one is an environment
+override. `scripts/calibrate_dense_solve.jl` re-measures them on any host and
+prints the export lines. This matters most for the accelerator backends: the
+CUDA and ROCm paths factor on the device (`cuda_dense_lu!`, `rocm_dense_lu!`),
+so their arithmetic-to-bandwidth ratio is not the CPU's, and a threshold
+calibrated here would be meaningless there. Those backends do not route through
+this code yet.
+
+The iteration constant is the exception: it is a property of the operator, not
+the machine, and it is deliberately set toward the high end of the measured
+range. Over-estimating iterations routes a marginal problem to the LU, which is
+never catastrophically wrong; under-estimating routes it to a Krylov solve that
+then costs several times the model's guess.
+
+### Convergence, precision and the fallback
+
+The tolerance is on the **true** relative residual `||b - Ax|| / ||b||`,
+recomputed against the operator, not on the preconditioned residual the Givens
+recursion tracks. The recursion only decides when to end an inner cycle.
+
+The Krylov space is carried in Float64 while the operator stays Float32, with
+DGKS reorthogonalisation. Both are load-bearing. An unreorthogonalised Float32
+Arnoldi recurrence loses orthogonality on this operator and reports iteration
+counts several times too large — which reads as bad conditioning rather than as
+a bug. The Float64 basis costs 16 bytes per entry for a few dozen vectors,
+kilobytes against a matrix measured in gigabytes.
+
+Two signatures distinguish the failure modes, and they are opposites:
+
+| symptom | cause |
+|---|---|
+| high count, and it changes with the restart length | orthogonality loss in the recurrence |
+| high count, and the restart makes no difference | the cycle is ending early — breakdown test, budget, or stall check |
+| low count, restart-invariant | healthy |
+
+A related tell for the first: with a degraded basis, *more* restarting gives
+*fewer* total iterations, because restarting discards the corrupted basis. That
+is backwards for a healthy solver, where a larger Krylov space can only help.
+
+GMRES falls back to the dense LU when it does not converge, reporting the
+fallback in the run's diagnostics rather than raising. The operator does not
+stagnate on the meshes tried, so this is a safety net rather than a load-bearing
+part of the feature — but it earned its place during development, when an
+unreachable tolerance turned a working solve into a failed one.
+
+`scripts/validate_gmres_burton_miller.jl` gates all of this against a real
+assembled operator across the frequency band. It asserts that the reference
+variant needs at least ten iterations, and that plain single Gram-Schmidt fails
+on the same system: three variants agreeing is evidence only because a fourth
+demonstrably fails. A routine validated only on cases that converge in five
+steps is not validated for the cases it exists for, and a mid-band-only gate
+would pass straight through a low-frequency conditioning regression.
+
 ## Performance Shape
 
 The expensive stages are:
@@ -199,11 +285,18 @@ The expensive stages are:
 
 Symmetry can improve runtime by more than the simple physical-area reduction would suggest because it reduces the dense system dimension. Assembly has to include image contributions, so its scaling is closer to the expected half-domain or quarter-domain work plus image passes. The direct Burton-Miller solve, however, scales roughly as \(O(N_p^3)\). Halving the P1 unknown count can make the dense solve approach one eighth of the full cost, and quartering it can make that portion much smaller still.
 
+That \(O(N_p^3)\) is the dense LU, and it is why reducing \(N_p\) has always
+outranked accelerating the solve. Above the adaptive router's crossover the
+exponent changes: with GMRES the solve becomes \(O(N_p^2)\) like assembly, the
+whole pipeline is quadratic, and what sets the ceiling is memory rather than
+time. Symmetry still helps, but by the square rather than the cube.
+
 ## Important Files
 
 - `src/blab/solvers/beat_engine_backend.py`: Python adapter that stages assets and streams JSON events.
 - `src/blab/solvers/julia_local/solver.jl`: request handling, mesh/radiator setup, frequency loop, backend dispatch, drive calculation.
 - `src/blab/solvers/julia_local/src/BeatEngineCore.jl`: mesh representation, shared quadrature/formulation code, Burton-Miller solve, field evaluation interfaces.
+- `src/blab/solvers/julia_local/src/BeatEngineDenseSolve.jl`: adaptive dense solve — the LU/GMRES cost model, the diagonally preconditioned GMRES, and the fallback.
 - `src/blab/solvers/julia_local/src/BeatEngineCpu.jl`: include hub for the CPU implementation files.
 - `src/blab/solvers/julia_local/src/BeatEngineCuda.jl`: include hub for the CUDA implementation files.
 - `src/blab/solvers/julia_local/src/BeatEngineRocm.jl`: include hub for the ROCm implementation files.

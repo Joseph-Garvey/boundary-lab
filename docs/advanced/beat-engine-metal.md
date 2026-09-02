@@ -205,6 +205,26 @@ Normal application use does not require these environment variables.
 | `BLAB_METAL_ATOMIC_SCATTER` | `1` | Diagnostic for `pair_atomic` only: `0` skips the atomic scatter to time the pair arithmetic (the operators are then wrong). |
 | `BLAB_BEAT_FUSED_BM` | `1` | Set to `0` to assemble the four operators and combine them on the host for exterior solves. Coupled solves, `host_staged` assembly and the `host` singular mode always take the four-operator path. |
 
+The fused system is then solved by the adaptive dense solve described in
+[BEAT Engine Core](beat-engine-core.md#adaptive-dense-solve) — dense LU or
+diagonally preconditioned GMRES, chosen per solve. Metal has no GPU LU, so
+both routes run on the host; shared storage means the host reads the assembled
+matrix in place rather than copying it. Its environment overrides:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `BLAB_BEAT_DENSE_SOLVE` | `auto` | Force `lu` or `gmres` instead of the cost model. |
+| `BLAB_BEAT_GMRES_TOL` | `1e-6` | Tolerance on the true relative residual. |
+| `BLAB_BEAT_GMRES_MAX_ITERATIONS` | `min(N, 1000)` | Iteration cap; reaching it reports non-convergence and falls back to the LU. |
+| `BLAB_BEAT_GMRES_RESTART` | `0` | Restart length; `0` is unrestarted. |
+| `BLAB_BEAT_GMRES_KRYLOV_PRECISION` | `f64` | `f32` reproduces the orthogonality-loss failure on demand. Not for production use. |
+| `BLAB_BEAT_GMRES_REORTHOGONALIZE` | `dgks` | `always` or `never`; `never` is the failing variant, kept so the remedies can be compared. |
+| `BLAB_BEAT_LU_GFLOPS` | `500` | Cost-model constants. Re-measure with `scripts/calibrate_dense_solve.jl` on any other machine. |
+| `BLAB_BEAT_MATVEC_ENTRY_SECONDS` | `9.52e-11` | |
+| `BLAB_BEAT_MATVEC_DOF_SECONDS` | `1.03e-6` | |
+| `BLAB_BEAT_TRIANGULAR_GBPS` | `14` | |
+| `BLAB_BEAT_GMRES_MODEL_ITERATIONS` | `210` | Expected iterations. A property of the operator, not the machine. |
+
 ## Verification
 
 CPU-versus-Metal validation scripts:
@@ -212,6 +232,7 @@ CPU-versus-Metal validation scripts:
 | Script | Coverage |
 |---|---|
 | `validate_metal_fused_burton_miller.jl` | Fused exterior system against the four-operator system, symmetry off/x/xy, multi-drive |
+| `validate_gmres_burton_miller.jl` | GMRES against the dense LU on a real assembled operator across the frequency band: true residual, three-way agreement between Krylov variants, restart independence, and that the failure mode the remedies cover is reachable. |
 | `validate_metal_exterior.jl` | Operators (both singular modes), boundary pressure, residual, and exterior field for an exterior solve. |
 | `validate_metal_symmetry.jl` | X and XY reduced-domain assembly and solve parity, both singular modes. |
 | `validate_metal_coupled.jl` | Coupled FEM-BEM-LEM assembly, condensation, solution, and field for the monolithic and condensed paths, prescribed-velocity and voltage excitations. |
