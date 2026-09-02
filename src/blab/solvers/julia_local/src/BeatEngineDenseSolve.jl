@@ -11,12 +11,13 @@
 #   per drive, with no factorization to share.
 #
 # Both are measured on the ATH ladder (see the head-to-head document). GMRES
-# needs 35-89 iterations on this operator, so it is O(N^2) against the LU's
-# O(N^3) and the two cross -- between 2,000 and 5,000 P1 dofs at one drive.
-# In the drive count the ranking is the other way round, because the LU
-# amortises its factorization across every drive and GMRES does not, and that
-# drive crossover itself grows with N (2.4-2.7 drives at 5,107 dofs, 4.6-7.4 at
-# 10,230). There is therefore no pair of thresholds to route on.
+# needs 51-136 iterations on this operator at a 1e-6 true residual, so it is
+# O(N^2) against the LU's O(N^3) and the two cross -- between 2,000 and 5,000
+# P1 dofs at one drive. In the drive count the ranking is the other way round,
+# because the LU amortises its factorization across every drive and GMRES does
+# not, and that drive crossover itself grows strongly with N: ~2.4 drives at
+# 5,107 dofs, ~4.0 at 10,230, ~11 at 20,422. There is therefore no pair of
+# thresholds to route on.
 #
 # An earlier revision of this file quoted "206-246 iterations, flat in N". That
 # band was a Float32 Arnoldi recurrence losing orthogonality, not the operator;
@@ -39,13 +40,15 @@
 # rather than weaker.
 #
 # GMRES falls back to the dense LU when it does not converge, reporting the
-# fallback rather than raising. BEAT's Burton-Miller operator does not stagnate
-# on the meshes tried, including the sliver-rim meshes where
-# hornlab-metal-bem's GMRES returns `info=-999`, so this is a safety net rather
-# than a load-bearing part of the feature. It earned its place during
-# development regardless: the Float32 Arnoldi bug made a 10,230-dof solve fail
-# to converge at 2 kHz, and the fallback turned that into a correct answer at
-# the LU's price instead of a failed solve.
+# fallback rather than raising. **This is load-bearing, not a safety net.** An
+# earlier revision of this comment claimed the operator never stagnates; that
+# was measured with the unreorthogonalised Float32 recurrence and is false. On
+# the sliver-rim ATH meshes, driven by the physical excitation rather than a
+# random one, GMRES floors at a true residual of 1.2e-6 to 9.4e-6 and cannot
+# reach 1e-6 below about 6 kHz -- the same mesh family and the same frequencies
+# where hornlab-metal-bem's GMRES returns `info=-999`. The geometry defeats
+# Krylov in both engines; what distinguishes this one is that it degrades to a
+# correct answer instead of killing the sweep.
 
 const BEAT_DENSE_SOLVE_METHOD_ENV = "BLAB_BEAT_DENSE_SOLVE"
 const BEAT_GMRES_TOLERANCE_ENV = "BLAB_BEAT_GMRES_TOL"
