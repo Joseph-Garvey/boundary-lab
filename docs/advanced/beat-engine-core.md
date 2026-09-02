@@ -291,10 +291,69 @@ exponent changes: with GMRES the solve becomes \(O(N_p^2)\) like assembly, the
 whole pipeline is quadratic, and what sets the ceiling is memory rather than
 time. Symmetry still helps, but by the square rather than the cube.
 
+## Start-up And Precompilation
+
+A worker process must load and compile the engine before it can solve
+anything, and until the bundle packages existed it did all of that from
+source. `solver.jl` `include`d 20,700 lines of engine and carried 1,300 lines
+of driver itself, and Julia caches native code only for packages — so neither
+the pkgimage cache nor the sysimage in `docker/` could see any of it. Measured
+on an M1 Max, spawn to worker-ready was 12-14 s, of which roughly 11 s was the
+engine load and the larger remaining part was compiling the worker's own entry
+path. Against a three-frequency A3 sweep that does about 1.8 s of real work,
+the start-up was several times the compute.
+
+The sources now live in packages, one per accelerator, under `julia_engine/`.
+Each bundle `include`s the same engine and driver files and carries a
+`PrecompileTools` workload that solves one frequency on a four-triangle
+tetrahedron. The workload is what earns most of the win: without it a first
+solve still JIT-compiles ~350 methods, with it ~90.
+
+- **One package per backend** because a package gets one precompile cache and
+  the engine picks its backend as it loads. `BEAT_ENGINE_BACKEND`, set by the
+  bundle, is what `BeatEngineCore` reads instead of the environment — the
+  environment it would read is the one the cache was *built* in.
+- **The workload runs on the CPU backend even in a GPU bundle.** It compiles
+  everything up to the backend branch, and it needs no device, which matters
+  because precompilation runs in a sandboxed worker on a machine that may have
+  no accelerator. What a GPU workload would add is kernel compilation, and that
+  cannot be cached to disk at all — it is why the Python side keeps one worker
+  alive across solves rather than starting one per job.
+- **Invalidation is Julia's own.** Every `include`d file is recorded in the
+  cache header and rechecked on load, so editing an engine source rebuilds the
+  pkgimage on the next process. A sysimage has no such check, which is why the
+  bundles are the mechanism and the sysimage in `docker/` is an optional extra
+  built once inside an image from the sources shipped in that image.
+
+Instantiating a backend environment is what installs its bundle
+(`Pkg.develop` of the bundle path is already recorded in `julia_local`,
+`julia_metal` and `julia_rocm`; the CUDA image does it in its Dockerfile). An
+environment without one still works: `solver.jl` falls back to including the
+sources directly, which is what the analysis scripts under `scripts/` and the
+Julia test suite do in any case.
+
+### Ahead-of-time codegen is not bit-identical to the JIT
+
+Compiling the numerical kernels ahead of time does not produce the same
+machine code as compiling them on first call, so a bundled worker's results
+differ from the pre-bundle path in the last bits. Measured on the CPU backend
+over the ATH ladder A1-A5 at 500, 2000 and 6000 Hz: SPL agrees to 2.0e-5 dB
+and pressures to about one Float32 ulp (6.5e-9 of peak). For scale, the Metal
+backend's atomics make it non-reproducible run-to-run at roughly 8e-7, two
+orders of magnitude larger, and the solver emits Float32 — 1e-5 dB is the last
+digit of the output format.
+
+It is not zero, though, so `BLAB_BEAT_ENGINE_BUNDLE=0` forces the include
+fallback, which is bit-identical to the pre-bundle path (verified over the
+same cases). Use it when a number has to be reproduced exactly; it costs the
+old start-up.
+
 ## Important Files
 
 - `src/blab/solvers/beat_engine_backend.py`: Python adapter that stages assets and streams JSON events.
-- `src/blab/solvers/julia_local/solver.jl`: request handling, mesh/radiator setup, frequency loop, backend dispatch, drive calculation.
+- `src/blab/solvers/julia_local/solver.jl`: the worker entry point — bundle resolution and dispatch only.
+- `src/blab/solvers/julia_local/BeatEngineDriver.jl`: request handling, mesh/radiator setup, frequency loop, backend dispatch, drive calculation.
+- `src/blab/solvers/julia_engine/BeatEngine{Cpu,Metal,Cuda,Rocm}Bundle`: the packages that include the engine and the driver so Julia can cache their native code.
 - `src/blab/solvers/julia_local/src/BeatEngineCore.jl`: mesh representation, shared quadrature/formulation code, Burton-Miller solve, field evaluation interfaces.
 - `src/blab/solvers/julia_local/src/BeatEngineDenseSolve.jl`: adaptive dense solve — the LU/GMRES cost model, the diagonally preconditioned GMRES, and the fallback.
 - `src/blab/solvers/julia_local/src/BeatEngineCpu.jl`: include hub for the CPU implementation files.

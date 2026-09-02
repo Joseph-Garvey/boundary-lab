@@ -1,4 +1,5 @@
 [deps]
 AMDGPU = "21141c5a-9bdb-4563-92ae-f87d6854732e"
+BeatEngineRocmBundle = "4dcecca2-7a78-4163-9eba-4966e709c0e0"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"

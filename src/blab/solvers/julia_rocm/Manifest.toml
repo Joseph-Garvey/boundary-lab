@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "415acc60be3d5196b592faf405db1f19cd82f54d"
+project_hash = "ae4cd0eca0232a8f470a389acd55f3790873e54e"
 
 [[deps.AMDGPU]]
 deps = ["AMDGPU_LLVM_Backend_jll", "AbstractFFTs", "AcceleratedKernels", "Adapt", "Atomix", "BFloat16s", "CEnum", "ExprTools", "GPUArrays", "GPUCompiler", "GPUToolbox", "KernelAbstractions", "LLVM", "LLVM_jll", "Libdl", "LinearAlgebra", "Pkg", "PrecompileTools", "Preferences", "PrettyTables", "Printf", "ROCmDeviceLibs_jll", "Random", "Random123", "RandomNumbers", "SparseArrays", "StaticArraysCore", "Statistics", "UnsafeAtomics"]
@@ -110,6 +110,12 @@ version = "0.6.1"
 [[deps.Base64]]
 uuid = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 version = "1.11.0"
+
+[[deps.BeatEngineRocmBundle]]
+deps = ["AMDGPU", "JSON", "LinearAlgebra", "PrecompileTools", "Printf", "SparseArrays", "StaticArrays", "Statistics"]
+path = "../julia_engine/BeatEngineRocmBundle"
+uuid = "4dcecca2-7a78-4163-9eba-4966e709c0e0"
+version = "0.1.0"
 
 [[deps.CEnum]]
 git-tree-sha1 = "389ad5c84de1ae7cf0e28e381131c98ea87d54fc"

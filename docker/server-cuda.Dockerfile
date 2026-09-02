@@ -52,7 +52,7 @@ RUN python3 -m venv /app/.venv \
     && pip install -e .
 
 RUN mkdir -p /opt/julia-depot /data/server_jobs \
-    && julia --project=/app/src/blab/solvers/julia_cuda --startup-file=no -e 'using Pkg; Pkg.instantiate(); using CUDA; CUDA.set_runtime_version!(v"12.6")' \
+    && julia --project=/app/src/blab/solvers/julia_cuda --startup-file=no -e 'using Pkg; Pkg.develop(path="/app/src/blab/solvers/julia_engine/BeatEngineCudaBundle"); Pkg.instantiate(); using CUDA; CUDA.set_runtime_version!(v"12.6")' \
     && julia --project=/app/src/blab/solvers/julia_cuda --startup-file=no -e 'using Pkg; Pkg.precompile(); using CUDA; CUDA.precompile_runtime()' \
     && if [ "${BLAB_BUILD_SYSIMAGE}" = "1" ]; then julia --startup-file=no /app/docker/build-beat-cuda-sysimage.jl; else echo "Skipping Julia sysimage build."; fi \
     && chmod -R a+rX /opt/julia-depot \

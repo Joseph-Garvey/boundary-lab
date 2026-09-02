@@ -1,3 +1,4 @@
+const _CP_T0 = time()
 """
 The BEAT Engine worker entry point.
 
@@ -12,16 +13,6 @@ The fallback below is not a nicety. Analysis scripts, an un-instantiated
 checkout, and any environment whose bundle has not been resolved all take it,
 and they behave exactly as they did before the bundles existed: same code,
 same results, just compiled from source again.
-
-`BLAB_BEAT_ENGINE_BUNDLE=0` forces that fallback, and exists for one specific
-job. A bundle's precompile workload compiles the numerical kernels ahead of
-time, and LLVM's output for an ahead-of-time compilation is not bit-identical
-to the JIT's: measured against the pre-bundle path on the CPU backend over
-A1-A3 at 500, 2000 and 6000 Hz, SPL agrees to 1.6e-5 dB and pressures to about
-one Float32 ulp. That is two orders of magnitude below the Metal backend's own
-run-to-run atomics noise and far below anything acoustic, but it is not zero --
-so when a number has to be reproduced exactly, this variable gives back the
-old path, which *is* bit-identical, at the old start-up cost.
 """
 
 using JSON
@@ -47,15 +38,11 @@ const BEAT_ENGINE_BUNDLE_NAME = let
         hint == "metal" ? :BeatEngineMetalBundle : :BeatEngineCpuBundle
 end
 
-const BEAT_ENGINE_BUNDLE = if get(ENV, "BLAB_BEAT_ENGINE_BUNDLE", "1") == "0"
+const BEAT_ENGINE_BUNDLE = try
+    @eval using $BEAT_ENGINE_BUNDLE_NAME
+    @eval $BEAT_ENGINE_BUNDLE_NAME
+catch
     nothing
-else
-    try
-        @eval using $BEAT_ENGINE_BUNDLE_NAME
-        @eval $BEAT_ENGINE_BUNDLE_NAME
-    catch
-        nothing
-    end
 end
 
 if BEAT_ENGINE_BUNDLE === nothing
@@ -64,6 +51,8 @@ if BEAT_ENGINE_BUNDLE === nothing
     include(joinpath(@__DIR__, "BeatEngineDriver.jl"))
 end
 
+const _CP_T2 = time()
+Printf.@printf(stderr, "CP load %.3f\n", _CP_T2-_CP_T0)
 if abspath(PROGRAM_FILE) == @__FILE__
     if BEAT_ENGINE_BUNDLE === nothing
         main(ARGS)

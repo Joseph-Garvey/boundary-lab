@@ -10,7 +10,9 @@ From the repository root:
 docker build -f docker/server-cuda.Dockerfile -t boundary-lab-server:cuda .
 ```
 
-The build installs Python dependencies, Julia, the `src/blab/solvers/julia_cuda` project, and a CUDA-focused Julia sysimage at `/app/blab-beat-cuda.so`. To skip the sysimage while keeping Julia precompilation, add `--build-arg BLAB_BUILD_SYSIMAGE=0`.
+The build installs Python dependencies, Julia, the `src/blab/solvers/julia_cuda` project with its `BeatEngineCudaBundle`, and a CUDA-focused Julia sysimage at `/app/blab-beat-cuda.so`. To skip the sysimage while keeping Julia precompilation, add `--build-arg BLAB_BUILD_SYSIMAGE=0`.
+
+Most of the start-up win is in the bundle, not the sysimage. The bundle is the package that holds the engine and the worker driver, so Julia's own pkgimage cache covers them; before it existed the sysimage could only bake CUDA, JSON and StaticArrays and every worker still compiled the engine from source. `BLAB_BUILD_SYSIMAGE=0` therefore costs far less than it used to. See [BEAT Engine Core](advanced/beat-engine-core.md#start-up-and-precompilation).
 
 ## Run Locally On A GPU Host
 
@@ -97,7 +99,7 @@ docker run --rm --gpus all \
   boundary-lab-server:cuda
 ```
 
-`BLAB_WARM_SOLVER=worker` starts the persistent Julia worker during server startup. `BLAB_WARM_SOLVER=tiny` also runs a one-frequency tetrahedron solve, which is slower to start but warms more CUDA/JIT paths before the first client job. The sysimage is built with `BLAB_JULIA_CPU_TARGET=generic,+aes`, which avoids host-specific targets while keeping AES-NI available for dependencies that emit AES intrinsics. Set `BLAB_JULIA_SYSIMAGE=` to disable the bundled sysimage for diagnostics.
+`BLAB_WARM_SOLVER=worker` starts the persistent Julia worker during server startup. `BLAB_WARM_SOLVER=tiny` also runs a one-frequency tetrahedron solve, which is slower to start but warms more CUDA/JIT paths before the first client job. Prefer `tiny`: the worker's remaining per-process cost after the bundles is GPU kernel compilation, which no cache on disk can hold, and only running a solve pays it. The sysimage is built with `BLAB_JULIA_CPU_TARGET=generic,+aes`, which avoids host-specific targets while keeping AES-NI available for dependencies that emit AES intrinsics. Set `BLAB_JULIA_SYSIMAGE=` to disable the bundled sysimage for diagnostics.
 
 The 20 MiB request limit accommodates typical Boundary Lab meshes while
 bounding memory use before JSON parsing. Base64 expands uploaded files, so the
