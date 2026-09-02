@@ -71,6 +71,7 @@ struct MetalRegularAssemblyCache{T,C}
     image_singular_caches::Vector{MetalSingularCorrectionCache{T}}
     image_singular_pair_count::Int
     gather_tables::Ref{Any}   # MetalGatherTables, built lazily by the pair_gather kernel mode
+    fused_gather_tables::Ref{Any}   # MetalFusedGatherTables, built lazily by the fused Burton-Miller path
 end
 
 struct MetalFieldEvaluationCache{T}

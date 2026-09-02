@@ -1,5 +1,6 @@
 using Test
 using StaticArrays
+using LinearAlgebra
 
 include(joinpath(@__DIR__, "..", "src", "BeatEngineCore.jl"))
 using .BeatEngineCore
@@ -161,6 +162,69 @@ end
     @test all(isfinite, real.(field))
     @test all(isfinite, imag.(field))
 
+end
+
+@testset "cpu fused Burton-Miller equals the four-operator path" begin
+    # The fused exterior path forms 0.5 I - D + (i/k) H and (-S - (i/k)(K' +
+    # 0.5 I)) q inside the assembly instead of combining four operators on the
+    # host. Both run in Float32, so they differ only by summation order. This
+    # runs every symmetry mode because the image-singular delta is where a sign
+    # slip in the fusion would be silent.
+    for (mesh_name, symmetry_mode) in (
+        ("sample.msh", :off),
+        ("sample_half.msh", :x),
+        ("sample_quarter.msh", :xy),
+    )
+        mesh = load_gmsh22_with_tags(joinpath(@__DIR__, "..", "test_meshes", mesh_name), Float32(0.001))
+        mesh = snap_symmetry_planes(mesh, symmetry_mode)
+        p1 = build_p1_space(mesh)
+        dp0 = build_dp0_space(mesh)
+        rule = triangle_rule(Float32, 2)
+        k = Float32(2pi * 1500.0 / 343.0)
+        element_indices = 1:min(48, length(mesh.faces))
+        singular_cache = build_singular_correction_cache(mesh, 2, element_indices)
+        cpu_cache = build_beat_cpu_assembly_cache(
+            mesh, p1, dp0, rule;
+            singular_order=2, element_indices=element_indices, symmetry_mode=symmetry_mode,
+        )
+        identity_p1_p1 = assemble_l2_identity_matrix(mesh, p1, dp0, rule, :p1, :p1; symmetry_mode=symmetry_mode)
+        identity_p1_dp0 = assemble_l2_identity_matrix(mesh, p1, dp0, rule, :p1, :dp0; symmetry_mode=symmetry_mode)
+
+        operators = assemble_regular_galerkin_operators(
+            mesh, p1, dp0, k, rule;
+            skip_singular=false, singular_order=2, element_indices=element_indices,
+            backend=:cpu, singular_cache=singular_cache, cpu_cache=cpu_cache,
+            symmetry_mode=symmetry_mode,
+        )
+        reference_lhs, reference_rhs_operator = BeatEngineCore.burton_miller_neumann_matrices(
+            operators, identity_p1_p1, identity_p1_dp0, k,
+        )
+
+        drive_count = 3
+        q_neumann = ComplexF32[
+            ComplexF32(sin(Float32(0.7 * row + 1.3 * column)), cos(Float32(0.4 * row - 0.9 * column)))
+            for row in 1:dp0.global_dof_count, column in 1:drive_count
+        ]
+        fused = assemble_burton_miller_neumann_system_cpu(
+            mesh, p1, dp0, q_neumann, k, rule;
+            identity_p1_p1=identity_p1_p1, identity_p1_dp0=identity_p1_dp0,
+            skip_singular=false, singular_order=2, element_indices=element_indices,
+            singular_cache=singular_cache, cpu_cache=cpu_cache, symmetry_mode=symmetry_mode,
+        )
+
+        @test fused.drive_count == drive_count
+        @test size(fused.matrix) == (p1.global_dof_count, p1.global_dof_count)
+        @test size(fused.rhs) == (p1.global_dof_count, drive_count)
+        lhs_scale = max(norm(reference_lhs), eps(Float32))
+        rhs_reference = reference_rhs_operator * q_neumann
+        rhs_scale = max(norm(rhs_reference), eps(Float32))
+        @test norm(fused.matrix - reference_lhs) / lhs_scale < 1.0f-5
+        @test norm(fused.rhs - rhs_reference) / rhs_scale < 1.0f-5
+
+        pressure = solve_burton_miller_neumann_system_cpu(fused)
+        reference_pressure = lu(copy(reference_lhs)) \ rhs_reference
+        @test norm(pressure - reference_pressure) / max(norm(reference_pressure), eps(Float32)) < 1.0f-4
+    end
 end
 
 @testset "cpu x symmetry assembly" begin

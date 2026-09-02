@@ -275,11 +275,10 @@ function _beat_cpu_subtract_regular_pair!(
     )
 end
 
-function _beat_cpu_accumulate_regular_pair_signed!(
-    single_layer,
-    double_layer,
-    adjoint_double_layer,
-    hypersingular,
+# The regular pair's four blocks, shared by the four-operator scatter below and
+# by the fused Burton-Miller scatter in BeatEngineCpuBurtonMiller.jl. Extracted
+# unchanged, so the four-operator path keeps its summation order exactly.
+function _beat_cpu_regular_pair_blocks(
     test_data::BeatCpuElementData{T},
     trial_data::BeatCpuElementData{T},
     test_quad::BeatCpuRegularQuadratureData{T},
@@ -287,8 +286,7 @@ function _beat_cpu_accumulate_regular_pair_signed!(
     normal_product::T,
     jac_scale::T,
     k::T,
-    ::Val{subtract},
-) where {T<:AbstractFloat,subtract}
+) where {T<:AbstractFloat}
     single_block = MVector{3,Complex{T}}(undef)
     adjoint_block = MVector{3,Complex{T}}(undef)
     double_block = MMatrix{3,3,Complex{T},9}(undef)
@@ -346,7 +344,26 @@ function _beat_cpu_accumulate_regular_pair_signed!(
             end
         end
     end
+    return single_block, adjoint_block, double_block, hyper_block
+end
 
+function _beat_cpu_accumulate_regular_pair_signed!(
+    single_layer,
+    double_layer,
+    adjoint_double_layer,
+    hypersingular,
+    test_data::BeatCpuElementData{T},
+    trial_data::BeatCpuElementData{T},
+    test_quad::BeatCpuRegularQuadratureData{T},
+    trial_quad::BeatCpuRegularQuadratureData{T},
+    normal_product::T,
+    jac_scale::T,
+    k::T,
+    ::Val{subtract},
+) where {T<:AbstractFloat,subtract}
+    single_block, adjoint_block, double_block, hyper_block = _beat_cpu_regular_pair_blocks(
+        test_data, trial_data, test_quad, trial_quad, normal_product, jac_scale, k,
+    )
     for local_row in 1:3
         row = test_data.p1_dofs[local_row]
         if subtract

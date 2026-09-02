@@ -229,6 +229,7 @@ function build_metal_regular_assembly_cache(
         image_singular_caches,
         image_singular_pair_count,
         Ref{Any}(nothing),
+        Ref{Any}(nothing),
     )
 end
 
@@ -252,5 +253,6 @@ function release_metal_regular_assembly_cache!(cache::MetalRegularAssemblyCache)
         release_metal_singular_correction_cache!(image_cache)
     end
     _release_metal_gather_tables!(cache)
+    _release_metal_fused_gather_tables!(cache)
     return nothing
 end

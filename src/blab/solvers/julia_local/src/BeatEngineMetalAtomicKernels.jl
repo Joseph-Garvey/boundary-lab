@@ -469,19 +469,12 @@ function _metal_singular_block_scatter_kernel!(
     return nothing
 end
 
-# Fused Duffy block kernel: one thread per (singular pair, part) evaluates the
-# Green's function once per point pair for all four operators, accumulating
-# in the same rank-1 form as the regular kernel. The separate slp/adjoint and
-# dlp/hyp block kernels evaluated it four times per point pair (the dlp/hyp
-# kernel ran one thread per trial basis function). A pair's Duffy rule
-# (512-1536 point pairs at singular order 4) is split into `part_count`
-# contiguous ranges so the launch has enough threads; the scatter kernel sums
-# the parts.
-function _metal_singular_fused_blocks_kernel!(
-    slp_values,
-    adjoint_values,
-    dlp_values,
-    hypersingular_values,
+# The Duffy pair arithmetic shared by the four-operator scatter kernel and the
+# fused Burton-Miller scatter kernel: one thread's part of one singular pair,
+# returning the 3x1 single-layer and adjoint blocks and the 3x3 double-layer
+# and hypersingular blocks.
+@inline function _metal_singular_pair_blocks(
+    linear_index::Int32,
     test_indices,
     trial_indices,
     rule_indices,
@@ -506,8 +499,6 @@ function _metal_singular_fused_blocks_kernel!(
     trial_curl_sign_y,
     trial_curl_sign_z,
 )
-    linear_index = Int32(thread_position_in_grid_1d())
-    linear_index > pair_count * part_count && return nothing
     pair_position = (linear_index - Int32(1)) % pair_count + Int32(1)
     part = (linear_index - Int32(1)) ÷ pair_count + Int32(1)
     T = typeof(k)
@@ -590,6 +581,56 @@ function _metal_singular_fused_blocks_kernel!(
     k2n = k * k * normal_product
     hyp_re = curl_products * g_total_re - hb_re * k2n
     hyp_im = curl_products * g_total_im - hb_im * k2n
+    return slp_re, slp_im, adj_re, adj_im, dlp_re, dlp_im, hyp_re, hyp_im
+end
+
+# Fused Duffy block kernel: one thread per (singular pair, part) evaluates the
+# Green's function once per point pair for all four operators, accumulating
+# in the same rank-1 form as the regular kernel. The separate slp/adjoint and
+# dlp/hyp block kernels evaluated it four times per point pair (the dlp/hyp
+# kernel ran one thread per trial basis function). A pair's Duffy rule
+# (512-1536 point pairs at singular order 4) is split into `part_count`
+# contiguous ranges so the launch has enough threads; the scatter kernel sums
+# the parts.
+function _metal_singular_fused_blocks_kernel!(
+    slp_values,
+    adjoint_values,
+    dlp_values,
+    hypersingular_values,
+    test_indices,
+    trial_indices,
+    rule_indices,
+    jac_scales,
+    normal_products,
+    rule_offsets,
+    rule_test_points,
+    rule_trial_points,
+    rule_weights,
+    face_vertices,
+    normals,
+    curls,
+    k,
+    face_count::Int32,
+    pair_count::Int32,
+    rule_point_count::Int32,
+    part_count::Int32,
+    trial_sign_x,
+    trial_sign_y,
+    trial_sign_z,
+    trial_curl_sign_x,
+    trial_curl_sign_y,
+    trial_curl_sign_z,
+)
+    linear_index = Int32(thread_position_in_grid_1d())
+    linear_index > pair_count * part_count && return nothing
+    slp_re, slp_im, adj_re, adj_im, dlp_re, dlp_im, hyp_re, hyp_im = _metal_singular_pair_blocks(
+        linear_index,
+        test_indices, trial_indices, rule_indices, jac_scales, normal_products,
+        rule_offsets, rule_test_points, rule_trial_points, rule_weights,
+        face_vertices, normals, curls, k, face_count, pair_count, rule_point_count, part_count,
+        trial_sign_x, trial_sign_y, trial_sign_z,
+        trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z,
+    )
     value_stride = pair_count * part_count
     @inbounds begin
         i = 1
