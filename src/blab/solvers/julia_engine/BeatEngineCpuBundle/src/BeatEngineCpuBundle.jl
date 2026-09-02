@@ -30,7 +30,24 @@ using PrecompileTools: @compile_workload
 
 const BEAT_ENGINE_BACKEND = "cpu"
 
-const ENGINE_DIR = normpath(joinpath(@__DIR__, "..", "..", "..", "julia_local"))
+#: Where the engine and driver sources are, found rather than assumed.
+#: Boundary Lab calls that directory `julia_local`; the Python wrapper that
+#: vendors these sources flattens it to `julia`. Looking for the directory
+#: that actually holds `BeatEngineCore.jl` means re-vendoring is a file copy
+#: and not a path rewrite -- and a path rewrite that was missed would fail at
+#: precompile time in the shipped package, which is the worst place to find it.
+const ENGINE_DIR = let root = normpath(joinpath(@__DIR__, "..", "..", ".."))
+    found = nothing
+    for name in ("julia_local", "julia")
+        candidate = joinpath(root, name)
+        if isfile(joinpath(candidate, "src", "BeatEngineCore.jl"))
+            found = candidate
+            break
+        end
+    end
+    found === nothing && error("No BEAT engine sources found under $(root).")
+    found
+end
 
 include(joinpath(ENGINE_DIR, "src", "BeatEngineCore.jl"))
 
