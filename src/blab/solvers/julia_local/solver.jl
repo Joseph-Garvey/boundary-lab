@@ -849,9 +849,43 @@ function solve_request_impl(request)
         )
     end
 
+    # Metal pipelining: the GPU assembles frequency i+1 on a worker task while
+    # the CPU factors and solves frequency i, the overlap hornlab-metal-bem
+    # relies on. Two operator sets are then resident at once. Requires a
+    # second Julia thread; with one thread the sweep stays sequential.
+    metal_pipeline = beat_backend == :metal && Threads.nthreads() > 1 &&
+        get(ENV, "BLAB_METAL_PIPELINE", "1") != "0"
+    assemble_for_frequency = function (k_value)
+        started = time()
+        assembled = assemble_regular_galerkin_operators(
+            mesh,
+            p1_space,
+            dp0_space,
+            k_value,
+            rule;
+            skip_singular=false,
+            singular_order=singular_order,
+            backend=beat_backend,
+            device_cache=device_cache,
+            return_device=true,
+            accelerator_quadrature=true,
+            singular_cache=singular_cache,
+            device_singular_cache=device_singular_cache,
+            metal_assembly_mode=metal_assembly_mode,
+            symmetry_mode=Symbol(symmetry_mode),
+        )
+        return (assembled, time() - started)
+    end
+    pending_assembly = nothing
+    if metal_pipeline && !isempty(frequencies)
+        first_k = FloatType(2pi) * FloatType(frequencies[1]) / sound_speed
+        pending_assembly = Threads.@spawn assemble_for_frequency(first_k)
+    end
+
     try
         for (index, freq_raw) in enumerate(frequencies)
             if cancel_path !== nothing && isfile(String(cancel_path))
+                pending_assembly === nothing || release_operator_storage!(fetch(pending_assembly)[1])
                 emit_event("cancelled"; solved_count=index - 1)
                 return
             end
@@ -895,28 +929,43 @@ function solve_request_impl(request)
             end
         end
 
+        pipelined_assembly_seconds = 0.0
         t_assembly = @elapsed begin
-            operators = assemble_regular_galerkin_operators(
-                mesh,
-                p1_space,
-                dp0_space,
-                k,
-                selected_rule;
-                skip_singular=false,
-                singular_order=singular_order,
-                backend=beat_backend,
-                device_cache=device_cache,
-                return_device=beat_backend != :cpu,
-                accelerator_quadrature=beat_backend != :cpu,
-                singular_cache=singular_cache,
-                cpu_cache=selected_cpu_assembly_cache,
-                device_singular_cache=device_singular_cache,
-                device_image_singular_cache=device_image_singular_cache,
-                rocm_assembly_mode=rocm_assembly_mode,
-                metal_assembly_mode=metal_assembly_mode,
-                symmetry_mode=Symbol(symmetry_mode),
-            )
+            if metal_pipeline
+                # Collect this frequency's operators from the worker task and
+                # immediately queue the next frequency's assembly behind it.
+                # The reported assembly time is the worker's own, even though
+                # it overlapped the previous frequency's solve.
+                operators, pipelined_assembly_seconds = fetch(pending_assembly)
+                pending_assembly = nothing
+                if index < length(frequencies)
+                    next_k = FloatType(2pi) * FloatType(frequencies[index + 1]) / sound_speed
+                    pending_assembly = Threads.@spawn assemble_for_frequency(next_k)
+                end
+            else
+                operators = assemble_regular_galerkin_operators(
+                    mesh,
+                    p1_space,
+                    dp0_space,
+                    k,
+                    selected_rule;
+                    skip_singular=false,
+                    singular_order=singular_order,
+                    backend=beat_backend,
+                    device_cache=device_cache,
+                    return_device=beat_backend != :cpu,
+                    accelerator_quadrature=beat_backend != :cpu,
+                    singular_cache=singular_cache,
+                    cpu_cache=selected_cpu_assembly_cache,
+                    device_singular_cache=device_singular_cache,
+                    device_image_singular_cache=device_image_singular_cache,
+                    rocm_assembly_mode=rocm_assembly_mode,
+                    metal_assembly_mode=metal_assembly_mode,
+                    symmetry_mode=Symbol(symmetry_mode),
+                )
+            end
         end
+        metal_pipeline && (t_assembly = pipelined_assembly_seconds)
 
         t_solve = 0.0
         t_field = 0.0
@@ -1055,6 +1104,12 @@ function solve_request_impl(request)
         )
         end
     finally
+        if pending_assembly !== nothing
+            try
+                release_operator_storage!(fetch(pending_assembly)[1])
+            catch
+            end
+        end
         if cuda_solve_identity_cache !== nothing
             release_cuda_burton_miller_identity_cache!(cuda_solve_identity_cache)
         end
