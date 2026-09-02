@@ -262,10 +262,18 @@ A related tell for the first: with a degraded basis, *more* restarting gives
 is backwards for a healthy solver, where a larger Krylov space can only help.
 
 GMRES falls back to the dense LU when it does not converge, reporting the
-fallback in the run's diagnostics rather than raising. The operator does not
-stagnate on the meshes tried, so this is a safety net rather than a load-bearing
-part of the feature — but it earned its place during development, when an
-unreachable tolerance turned a working solve into a failed one.
+fallback in the run's diagnostics rather than raising. **This is load-bearing,
+not a safety net.** On sliver-rimmed meshes the operator floors out at a true
+residual of 2e-6 to 9e-6 and cannot reach 1e-6 at the low end of the band, so
+the fallback is what makes those solves work at all. A Krylov path that raised
+on non-convergence would fail them outright.
+
+The known cost is that the router cannot see this coming — it prices a
+converging GMRES — so on such a mesh the solve pays for the failed attempt and
+the factorization, about 1.8x the LU alone. It is a routing defect rather than
+a correctness one: the answer is right either way. See the head-to-head
+document's "Known regression: A1r routes to GMRES and loses" for the
+measurements and the candidate fixes.
 
 The achievable *true* residual has a Float32 floor, and it depends on how the
 residual is evaluated. The solver computes `b - Ax` as one fused gemv
