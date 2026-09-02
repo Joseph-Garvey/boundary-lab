@@ -32,6 +32,7 @@ struct MetalRegularAssemblyCache{T,C}
     curls
     rule_points
     rule_weights
+    element_rule_points   # face_count x rule_count x 3: every element's regular quadrature points
     vertex_offsets
     incident_elements
     incident_local_indices
@@ -49,6 +50,7 @@ struct MetalRegularAssemblyCache{T,C}
     image_transforms::Vector{SymmetryTransform}
     image_singular_caches::Vector{MetalSingularCorrectionCache{T}}
     image_singular_pair_count::Int
+    gather_tables::Ref{Any}   # MetalGatherTables, built lazily by the pair_gather kernel mode
 end
 
 struct MetalFieldEvaluationCache{T}
@@ -74,7 +76,7 @@ function _metal_kernel_groupsize()
 end
 
 function _normalized_metal_regular_kernel_mode(value=nothing)
-    value === nothing && (value = get(ENV, "BLAB_METAL_REGULAR_KERNEL_MODE", "pair_atomic"))
+    value === nothing && (value = get(ENV, "BLAB_METAL_REGULAR_KERNEL_MODE", "pair_gather"))
     mode = Symbol(lowercase(strip(String(value))))
     aliases = Dict(
         :pair => :pair_owned,
@@ -86,10 +88,14 @@ function _normalized_metal_regular_kernel_mode(value=nothing)
         :atomic => :pair_atomic,
         :pair_atomic => :pair_atomic,
         :fused_atomic => :pair_atomic,
+        :gather => :pair_gather,
+        :pair_gather => :pair_gather,
+        :chunked => :pair_gather,
+        :chunked_pair_gather => :pair_gather,
     )
     normalized = get(aliases, mode, nothing)
     normalized === nothing && error(
-        "BLAB_METAL_REGULAR_KERNEL_MODE must be pair_owned, pair_atomic, or entry_owned; got $(value).",
+        "BLAB_METAL_REGULAR_KERNEL_MODE must be pair_gather, pair_atomic, pair_owned, or entry_owned; got $(value).",
     )
     return normalized
 end

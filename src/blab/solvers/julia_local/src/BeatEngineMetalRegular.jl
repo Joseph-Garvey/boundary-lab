@@ -75,6 +75,26 @@ function _metal_incident_element_arrays(
     return offsets, incident_elements, incident_local_indices, dp0_elements
 end
 
+# Every element's regular-rule quadrature points, laid out
+# [face, rule point, coordinate] so a kernel reads a point with three loads
+# instead of nine vertex loads and nine FMAs.
+function _metal_element_rule_points(mesh::BoundaryMesh{T}, rule::TriangleRule{T}) where {T}
+    face_count = length(mesh.faces)
+    rule_count = length(rule.points)
+    points = Array{T}(undef, face_count, rule_count, 3)
+    for face in 1:face_count
+        v1, v2, v3 = mesh.face_vertices[face]
+        for (q, point) in enumerate(rule.points)
+            xi, eta = point[1], point[2]
+            p = (one(T) - xi - eta) * v1 + xi * v2 + eta * v3
+            points[face, q, 1] = p[1]
+            points[face, q, 2] = p[2]
+            points[face, q, 3] = p[3]
+        end
+    end
+    return points
+end
+
 function _metal_local_dof_arrays(
     p1_space::P1Space,
     dp0_space::DP0Space,
@@ -166,6 +186,7 @@ function build_metal_regular_assembly_cache(
     end
     face_vertices, normals, areas, faces, curls = _metal_geometry_arrays(mesh)
     rule_points, rule_weights = _metal_rule_arrays(rule)
+    element_rule_points = _metal_element_rule_points(mesh, rule)
     vertex_offsets, incident_elements, incident_local_indices, dp0_elements =
         _metal_incident_element_arrays(p1_space, dp0_space, indices)
     p1_dofs, element_dp0_dofs =
@@ -189,6 +210,7 @@ function build_metal_regular_assembly_cache(
         MtlArray(curls),
         MtlArray(rule_points),
         MtlArray(rule_weights),
+        MtlArray(element_rule_points),
         MtlArray(vertex_offsets),
         MtlArray(incident_elements),
         MtlArray(incident_local_indices),
@@ -206,6 +228,7 @@ function build_metal_regular_assembly_cache(
         image_transforms,
         image_singular_caches,
         image_singular_pair_count,
+        Ref{Any}(nothing),
     )
 end
 
@@ -217,6 +240,7 @@ function release_metal_regular_assembly_cache!(cache::MetalRegularAssemblyCache)
     Metal.unsafe_free!(cache.curls)
     Metal.unsafe_free!(cache.rule_points)
     Metal.unsafe_free!(cache.rule_weights)
+    Metal.unsafe_free!(cache.element_rule_points)
     Metal.unsafe_free!(cache.vertex_offsets)
     Metal.unsafe_free!(cache.incident_elements)
     Metal.unsafe_free!(cache.incident_local_indices)
@@ -227,5 +251,6 @@ function release_metal_regular_assembly_cache!(cache::MetalRegularAssemblyCache)
     for image_cache in cache.image_singular_caches
         release_metal_singular_correction_cache!(image_cache)
     end
+    _release_metal_gather_tables!(cache)
     return nothing
 end

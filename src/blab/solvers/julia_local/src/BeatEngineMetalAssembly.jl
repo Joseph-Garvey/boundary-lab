@@ -61,11 +61,14 @@ function _assemble_regular_galerkin_operators_metal_native(
     # correction is a Duffy-minus-regular delta. In native mode they skip the
     # image-singular pairs (skip_mode 1) and the gather kernel adds Duffy.
     skip_image_singular = !skip_singular && singular_mode == :native
+    empty!(_metal_gather_stage_timing)
     kernel_elapsed = @elapsed begin
         if regular_kernel_mode == :pair_owned
             _launch_metal_regular_pair_kernels!(operators, native_cache, k)
         elseif regular_kernel_mode == :pair_atomic
             _launch_metal_regular_atomic_kernels!(operators, native_cache, k)
+        elseif regular_kernel_mode == :pair_gather
+            _launch_metal_regular_gather_kernels!(operators, native_cache, k)
         else
             _launch_metal_regular_entry_kernels!(operators, native_cache, k)
         end
@@ -88,6 +91,15 @@ function _assemble_regular_galerkin_operators_metal_native(
                     k;
                     skip_image_singular=skip_image_singular,
                 )
+            elseif regular_kernel_mode == :pair_gather
+                _launch_metal_symmetry_regular_gather_kernels!(
+                    operators,
+                    native_cache,
+                    image_cache,
+                    transform,
+                    k;
+                    skip_image_singular=skip_image_singular,
+                )
             else
                 _launch_metal_symmetry_regular_entry_kernels!(
                     operators,
@@ -102,6 +114,11 @@ function _assemble_regular_galerkin_operators_metal_native(
         Metal.synchronize()
     end
     timing !== nothing && (timing["metal_native_regular_kernel"] = kernel_elapsed)
+    if timing !== nothing
+        for (stage, elapsed) in _metal_gather_stage_timing
+            timing["metal_native_gather_" * stage] = elapsed
+        end
+    end
 
     indices = native_cache.element_indices
     correction_cache = singular_cache === nothing ? build_singular_correction_cache(mesh, singular_order, indices) : singular_cache
@@ -117,7 +134,7 @@ function _assemble_regular_galerkin_operators_metal_native(
             end
         end
         timing !== nothing && (timing["metal_native_singular_cache"] = cache_elapsed)
-        singular_launch! = regular_kernel_mode == :pair_atomic ?
+        singular_launch! = regular_kernel_mode in (:pair_atomic, :pair_gather) ?
             _launch_metal_singular_block_scatter_kernels! :
             _launch_metal_singular_block_gather_kernels!
         singular_elapsed = @elapsed begin
@@ -161,7 +178,8 @@ function _assemble_regular_galerkin_operators_metal_native(
     kernel_groupsize = _metal_kernel_groupsize()
     color_count = length(native_cache.color_offsets) - 1
     kernel_name = regular_kernel_mode == :pair_owned ? "colored_pair_owned" :
-        regular_kernel_mode == :pair_atomic ? "fused_pair_atomic" : "entry_owned"
+        regular_kernel_mode == :pair_atomic ? "fused_pair_atomic" :
+        regular_kernel_mode == :pair_gather ? "chunked_pair_gather" : "entry_owned"
     mode_name = "metal_native_" * kernel_name * (singular_mode == :native ? "" : "_host_singular")
     return merge(
         operators,
@@ -180,6 +198,7 @@ function _assemble_regular_galerkin_operators_metal_native(
             regular_kernel_launches=regular_kernel_mode == :pair_owned ?
                 2 * (image_count + 1) * color_count^2 :
                 regular_kernel_mode == :pair_atomic ? (image_count + 1) :
+                regular_kernel_mode == :pair_gather ? 3 * (image_count + 1) * _metal_gather_chunk_count(native_cache) :
                 2 * (image_count + 1),
             regular_kernel_mode=mode_name,
             regular_assembly_mode=Symbol(mode_name),

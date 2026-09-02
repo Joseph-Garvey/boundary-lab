@@ -119,7 +119,7 @@ function _metal_singular_slp_adjoint_blocks_kernel!(
     q = Int(rule_offsets[rule_index])
     q_stop = Int(rule_offsets[rule_index + 1]) - 1
     jac_scale = jac_scales[pair_position]
-    four_pi = typeof(k)(12.566370614359172)
+    inv_four_pi = typeof(k)(0.07957747154594767)
     test_nx = normals[test_index]
     test_ny = normals[test_index + face_count]
     test_nz = normals[test_index + 2 * face_count]
@@ -148,13 +148,14 @@ function _metal_singular_slp_adjoint_blocks_kernel!(
         dx = sx - x
         dy = sy - y
         dz = sz - z
-        radius = sqrt(dx * dx + dy * dy + dz * dz)
-        if radius > zero(k)
-            inv_radius = one(k) / radius
+        radius2 = dx * dx + dy * dy + dz * dz
+        if radius2 > zero(k)
+            inv_radius = _metal_fast_rsqrt(radius2)
+            radius = radius2 * inv_radius
             phase = k * radius
-            green_scale = inv_radius / four_pi
-            green_re = cos(phase) * green_scale
-            green_im = sin(phase) * green_scale
+            green_scale = inv_radius * inv_four_pi
+            green_re = _metal_fast_cos(phase) * green_scale
+            green_im = _metal_fast_sin(phase) * green_scale
             weight = rule_weights[q] * jac_scale
             test_dot = -(dx * test_nx + dy * test_ny + dz * test_nz) * inv_radius
             grad_re = (-green_re * inv_radius - green_im * k) * test_dot
@@ -214,7 +215,7 @@ function _metal_singular_dlp_hyp_blocks_kernel!(
     q_stop = Int(rule_offsets[rule_index + 1]) - 1
     jac_scale = jac_scales[pair_position]
     normal_product = normal_products[pair_position]
-    four_pi = typeof(k)(12.566370614359172)
+    inv_four_pi = typeof(k)(0.07957747154594767)
     k2 = k * k
     trial_nx = trial_sign_x * normals[trial_index]
     trial_ny = trial_sign_y * normals[trial_index + face_count]
@@ -261,13 +262,14 @@ function _metal_singular_dlp_hyp_blocks_kernel!(
         dx = sx - x
         dy = sy - y
         dz = sz - z
-        radius = sqrt(dx * dx + dy * dy + dz * dz)
-        if radius > zero(k)
-            inv_radius = one(k) / radius
+        radius2 = dx * dx + dy * dy + dz * dz
+        if radius2 > zero(k)
+            inv_radius = _metal_fast_rsqrt(radius2)
+            radius = radius2 * inv_radius
             phase = k * radius
-            green_scale = inv_radius / four_pi
-            green_re = cos(phase) * green_scale
-            green_im = sin(phase) * green_scale
+            green_scale = inv_radius * inv_four_pi
+            green_re = _metal_fast_cos(phase) * green_scale
+            green_im = _metal_fast_sin(phase) * green_scale
             weight = rule_weights[q] * jac_scale
             trial_dot = (dx * trial_nx + dy * trial_ny + dz * trial_nz) * inv_radius
             grad_re = (-green_re * inv_radius - green_im * k) * trial_dot

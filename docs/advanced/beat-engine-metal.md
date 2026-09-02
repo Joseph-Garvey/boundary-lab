@@ -25,11 +25,15 @@ frequency-independent cache data on the CPU. The Metal worker then:
 
 1. allocates the single-layer, double-layer, adjoint double-layer, and
    hypersingular matrices as `MtlArray` objects;
-2. evaluates regular Galerkin pairs with one fused kernel, one thread per
-   element pair on a two-dimensional grid, every Green's-function value used
-   for all four operators, scattered with Float32 atomics;
-3. evaluates adjacent and coincident pairs with Duffy singular quadrature and
-   gathers their compact correction blocks into the dense operators;
+2. evaluates regular Galerkin pairs in chunks of trial elements: one thread
+   per element pair on a two-dimensional grid writes the pair's 3x1 and 3x3
+   operator blocks to a device buffer, every Green's-function value used for
+   all four operators, and gather kernels with one owner per matrix entry
+   sum the buffer into the dense operators (no atomics, fixed summation
+   order);
+3. evaluates adjacent and coincident pairs with Duffy singular quadrature in
+   one fused kernel per pair and scatters their compact correction blocks
+   into the dense operators;
 4. applies symmetry-image contributions and reduced-domain row weights;
 5. copies the four operators to unified host memory, forms the Burton-Miller
    system, and factors it once per frequency with LAPACK on the CPU, reusing
@@ -51,18 +55,51 @@ On Apple Silicon the copy from device to host is a memcpy within unified
 memory, and the CPU LU runs through Accelerate-class BLAS. The backend's
 dense-size ceiling is therefore the same as the CPU backend's.
 
-Three regular-assembly kernels exist. The default, `pair_atomic`, is the
-fused atomic kernel described above; it uses the fast-math AIR intrinsics
-(`air.fast_sin`, `air.fast_cos`, `air.fast_rsqrt`), the same arithmetic an
-Xcode-compiled Metal shader gets by default, 32-bit indices, and trial
-quadrature points hoisted out of the point-pair loop. Its singular
-corrections are scattered per pair with atomics too. `pair_owned` is the
-ROCm backend's colored pair-owned design, deterministic because no two pairs
-in one launch share a matrix entry; `entry_owned`, one thread per dense
-matrix entry, is the correctness reference and does roughly nine times the
-Green's-function work. On an M1 Max at 5k P1 dofs and quadrature order 4
-they take 3.7 s, 6.8 s, and about 25 s per frequency; all three agree with
-BEAT CPU to the same tolerances.
+Four regular-assembly kernel modes exist. The default, `pair_gather`, is
+the chunked pair-gather design described above. It exists because the
+fused atomic kernel was bound by atomic throughput, not arithmetic: each
+pair scatters 48 Float32 atomics (four operators, real and imaginary), and
+on an M1 Max those cost as much as the Green's-function evaluations
+themselves. Writing the blocks with plain stores and gathering them per
+entry removes the atomics and makes the result bit-reproducible run to run.
+The trial columns are processed in chunks sized from a device-memory budget
+(`BLAB_METAL_GATHER_BUDGET_MB`, 512 MB by default, 192 bytes per pair per
+chunk column). `pair_atomic` is the fused kernel with atomic scatter,
+non-deterministic in float32 summation order; `pair_owned` is the ROCm
+backend's colored pair-owned design, deterministic because no two pairs in
+one launch share a matrix entry; `entry_owned`, one thread per dense matrix
+entry, is the correctness reference and does roughly nine times the
+Green's-function work.
+
+All modes share one pair-arithmetic routine: the fast-math AIR intrinsics
+(`air.fast_sin`, `air.fast_cos`, `air.fast_rsqrt`, the arithmetic an
+Xcode-compiled Metal shader gets by default), 32-bit indices, a rank-1
+accumulation (3-vector inner sums, outer products once per test point),
+a compile-time unrolled trial loop, and per-element quadrature points
+precomputed once per cache so a point costs three loads instead of nine
+vertex loads and nine FMAs. The kernel is register-bound (the 3x3 double
+layer and hypersingular accumulators alone are 36 floats), so trial data is
+read from cached device arrays rather than hoisted into registers.
+
+The singular corrections use one fused Duffy kernel per (pair, part) that
+evaluates the Green's function once per point pair for all four operators;
+a pair's rule (512 to 1536 point pairs at singular order 4) is split into
+`BLAB_METAL_SINGULAR_PARTS` contiguous ranges and a scatter kernel sums the
+parts with atomics (about 48 per pair, negligible).
+
+On an M1 Max at 5,041 P1 dofs (10,078 faces), quadrature order 4, singular
+order 4, one frequency: `pair_gather` assembles in about 1.06 s (pair
+kernel 0.59 s, gathers 0.31 s, singular 0.12 s, allocation 0.04 s);
+`pair_atomic` 1.9 s; the first port's colored `pair_owned` kernels 7.1 s;
+`entry_owned` about 25 s. All modes agree with BEAT CPU to the same
+tolerances. hornlab-metal-bem's P1 Galerkin kernel, which
+assembles one operator with 18 atomics per pair, takes 0.42 s on the same
+mesh.
+
+A frequency sweep overlaps the GPU assembly of frequency i+1 with the CPU
+factorization of frequency i on a second Julia thread
+(`BLAB_METAL_PIPELINE=0` disables it); two operator sets are then resident
+at once.
 
 ## Requirements
 
@@ -95,9 +132,15 @@ Normal application use does not require these environment variables.
 | Variable | Default | Purpose |
 |---|---|---|
 | `BLAB_METAL_ASSEMBLY_MODE` | `native` | Use `host_staged` to assemble operators on the CPU and upload them as a diagnostic fallback. |
-| `BLAB_METAL_REGULAR_KERNEL_MODE` | `pair_atomic` | Use `pair_owned` for the deterministic colored kernels or `entry_owned` as the correctness reference. |
+| `BLAB_METAL_REGULAR_KERNEL_MODE` | `pair_gather` | Use `pair_atomic` for the fused atomic kernel, `pair_owned` for the deterministic colored kernels, or `entry_owned` as the correctness reference. |
 | `BLAB_METAL_SINGULAR_MODE` | `native` | Use `host` to compute the Duffy singular corrections on the CPU and add them to the device operators, separating kernel defects from rule defects. |
-| `BLAB_METAL_KERNEL_GROUPSIZE` | `256` | Threads per threadgroup for the assembly kernels. |
+| `BLAB_METAL_KERNEL_GROUPSIZE` | `256` | Threads per threadgroup for the one-dimensional assembly kernels. |
+| `BLAB_METAL_ATOMIC_TILE` | `16x16` | Threadgroup shape (test, trial) of the two-dimensional pair kernels. |
+| `BLAB_METAL_GATHER_BUDGET_MB` | `512` | Device memory for the pair-block buffer; sets the trial chunk size of `pair_gather`. `BLAB_METAL_GATHER_CHUNK` overrides the chunk size directly. |
+| `BLAB_METAL_GATHER_TIMING` | `0` | Set to `1` to synchronize after each `pair_gather` stage and report `metal_native_gather_*` timings (slower). |
+| `BLAB_METAL_SINGULAR_PARTS` | `4` | Ranges each singular pair's Duffy rule is split into across threads. |
+| `BLAB_METAL_PIPELINE` | `1` | Set to `0` to assemble and solve each sweep frequency sequentially instead of overlapping GPU assembly with the CPU factorization. |
+| `BLAB_METAL_ATOMIC_SCATTER` | `1` | Diagnostic for `pair_atomic` only: `0` skips the atomic scatter to time the pair arithmetic (the operators are then wrong). |
 
 ## Verification
 
