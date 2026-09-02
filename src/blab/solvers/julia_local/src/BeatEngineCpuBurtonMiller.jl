@@ -9,12 +9,13 @@
 # combining them afterwards. The result is one N x N matrix and one right-hand
 # side per drive rather than 6N^2 complex entries.
 #
-# What it is NOT worth: the per-quadrature-point arithmetic is unchanged. The
-# combination is formed once per pair from the finished 3x1 and 3x3 blocks, and
-# fusing the accumulators themselves would not remove a single complex FMA from
-# the inner loop (both operators need the same two products per entry). The
-# Metal probe measured the same thing on the GPU: 82-84% of the pair kernel is
-# arithmetic, not stores. So this path buys memory and scatter traffic.
+# The combination is applied per quadrature point pair, before the 3x3
+# accumulation, not afterwards to four finished blocks. That is where the time
+# is: combining afterwards was measured at 1.00x on the Metal pair kernel,
+# combining before it at 1.85x. Per entry of the 3x3 block the four-operator
+# form costs a multiply, a subtract and two FMAs across two accumulators; the
+# combined form costs one FMA into one, because the hypersingular curl term
+# carries no basis product and can be summed once and added after the loop.
 #
 # The four-operator path stays for the coupled FEM/LEM solver and for any
 # operator preconditioner. This is an exterior-only fast path.
@@ -22,41 +23,96 @@
 # Every stage is test-element owned exactly as the four-operator assembly is,
 # so the same colouring keeps the threaded writes race-free.
 
-@inline function _beat_cpu_bm_scatter_blocks!(
+@inline function _beat_cpu_bm_scatter!(
     lhs,
     rhs,
     q_neumann,
     test_p1_dofs::NTuple{3,Int},
     trial_p1_dofs::NTuple{3,Int},
     dp0_dof::Int,
-    single_block,
-    adjoint_block,
-    double_block,
-    hyper_block,
-    coupling::Complex{T},
+    lhs_block,
+    rhs_block,
     ::Val{subtract},
-) where {T<:AbstractFloat,subtract}
+) where {subtract}
     drive_count = size(q_neumann, 2)
     @inbounds for local_row in 1:3
         row = test_p1_dofs[local_row]
-        coefficient = -single_block[local_row] - coupling * adjoint_block[local_row]
-        subtract && (coefficient = -coefficient)
+        coefficient = subtract ? -rhs_block[local_row] : rhs_block[local_row]
         for drive in 1:drive_count
             rhs[row, drive] += coefficient * q_neumann[dp0_dof, drive]
         end
         for local_col in 1:3
             column = trial_p1_dofs[local_col]
-            value = -double_block[local_row, local_col] + coupling * hyper_block[local_row, local_col]
+            value = lhs_block[local_row, local_col]
             lhs[row, column] += subtract ? -value : value
         end
     end
     return nothing
 end
 
-# The Duffy/tensor-product pair's four blocks. The four-operator path's
-# `_beat_cpu_accumulate_pair!` scatters inside the quadrature loop instead of
-# accumulating blocks, so this is a separate loop rather than an extraction;
-# the arithmetic per point is identical.
+# The pair's Burton-Miller contribution, combined per quadrature point pair.
+#
+#   lhs entry = -D + eta H
+#             = sum_q basis_product * (-wd - eta k^2 (n.n') wg) + curl * eta sum_q wg
+#   rhs entry = -S - eta K' = sum_q test_basis * (-wg - eta wa)
+#
+# The curl term carries no basis product, so it leaves the 3x3 loop entirely:
+# one scalar accumulates over the quadrature and the 3x3 outer product is added
+# once after it. What is left inside is one FMA per entry.
+function _beat_cpu_bm_regular_pair_blocks(
+    test_data::BeatCpuElementData{T},
+    trial_data::BeatCpuElementData{T},
+    test_quad::BeatCpuRegularQuadratureData{T},
+    trial_quad::BeatCpuRegularQuadratureData{T},
+    normal_product::T,
+    jac_scale::T,
+    k::T,
+    coupling::Complex{T},
+) where {T<:AbstractFloat}
+    lhs_block = zero(MMatrix{3,3,Complex{T},9})
+    rhs_block = zero(MVector{3,Complex{T}})
+    curl_total = zero(Complex{T})
+    k2n = coupling * (k * k * normal_product)
+
+    @inbounds for test_q in eachindex(test_quad.weights)
+        test_basis = test_quad.basis[test_q]
+        x = test_quad.points[test_q]
+        test_weight = test_quad.weights[test_q]
+        for trial_q in eachindex(trial_quad.weights)
+            trial_basis = trial_quad.basis[trial_q]
+            r_vec = trial_quad.points[trial_q] - x
+            radius = norm(r_vec)
+            radius == zero(T) && continue
+            inv_radius = inv(radius)
+            green = _beat_cpu_green(radius, inv_radius, k)
+            grad_scale = green * Complex{T}(-inv_radius, k)
+            weight = test_weight * trial_quad.weights[trial_q] * jac_scale
+            weighted_green = green * weight
+            lhs_scale = -grad_scale * (dot(r_vec, trial_data.normal) * inv_radius) * weight -
+                k2n * weighted_green
+            rhs_scale = -weighted_green -
+                coupling * grad_scale * (-dot(r_vec, test_data.normal) * inv_radius) * weight
+            curl_total += weighted_green
+            for local_row in 1:3
+                test_value = test_basis[local_row]
+                rhs_block[local_row] += test_value * rhs_scale
+                for local_col in 1:3
+                    lhs_block[local_row, local_col] +=
+                        (test_value * trial_basis[local_col]) * lhs_scale
+                end
+            end
+        end
+    end
+    curl_total *= coupling
+    @inbounds for local_row in 1:3, local_col in 1:3
+        lhs_block[local_row, local_col] +=
+            dot(test_data.curls[local_row], trial_data.curls[local_col]) * curl_total
+    end
+    return lhs_block, rhs_block
+end
+
+# The same combination over a Duffy (or image-delta) rule, whose points and
+# basis values are not precomputed per element.
 function _beat_cpu_bm_pair_blocks(
     test_vertices::NTuple{3,SVector{3,T}},
     trial_vertices::NTuple{3,SVector{3,T}},
@@ -67,21 +123,15 @@ function _beat_cpu_bm_pair_blocks(
     normal_product::T,
     jac_scale::T,
     k::T,
+    coupling::Complex{T},
     test_points,
     trial_points,
     weights,
 ) where {T<:AbstractFloat}
-    single_block = zero(MVector{3,Complex{T}})
-    adjoint_block = zero(MVector{3,Complex{T}})
-    double_block = zero(MMatrix{3,3,Complex{T},9})
-    hyper_block = zero(MMatrix{3,3,Complex{T},9})
-    curl_products = MMatrix{3,3,T,9}(undef)
-    for local_row in 1:3
-        for local_col in 1:3
-            curl_products[local_row, local_col] = dot(test_curls[local_row], trial_curls[local_col])
-        end
-    end
-    k2 = k * k
+    lhs_block = zero(MMatrix{3,3,Complex{T},9})
+    rhs_block = zero(MVector{3,Complex{T}})
+    curl_total = zero(Complex{T})
+    k2n = coupling * (k * k * normal_product)
 
     @inbounds for q in eachindex(weights)
         test_basis = p1_values(test_points[q])
@@ -91,32 +141,29 @@ function _beat_cpu_bm_pair_blocks(
         r_vec = y - x
         radius = norm(r_vec)
         radius == zero(T) && continue
-
         inv_radius = inv(radius)
         green = _beat_cpu_green(radius, inv_radius, k)
         grad_scale = green * Complex{T}(-inv_radius, k)
-        trial_dot = dot(r_vec, trial_normal) * inv_radius
-        test_dot = -dot(r_vec, test_normal) * inv_radius
         weight = weights[q] * jac_scale
         weighted_green = green * weight
-        weighted_double = grad_scale * trial_dot * weight
-        weighted_adjoint = grad_scale * test_dot * weight
-
+        lhs_scale = -grad_scale * (dot(r_vec, trial_normal) * inv_radius) * weight -
+            k2n * weighted_green
+        rhs_scale = -weighted_green -
+            coupling * grad_scale * (-dot(r_vec, test_normal) * inv_radius) * weight
+        curl_total += weighted_green
         for local_row in 1:3
             test_value = test_basis[local_row]
-            single_block[local_row] += test_value * weighted_green
-            adjoint_block[local_row] += test_value * weighted_adjoint
+            rhs_block[local_row] += test_value * rhs_scale
             for local_col in 1:3
-                basis_product = test_value * trial_basis[local_col]
-                double_block[local_row, local_col] += basis_product * weighted_double
-                hyper_block[local_row, local_col] += (
-                    curl_products[local_row, local_col] - k2 * basis_product * normal_product
-                ) * weighted_green
+                lhs_block[local_row, local_col] += (test_value * trial_basis[local_col]) * lhs_scale
             end
         end
     end
-
-    return single_block, adjoint_block, double_block, hyper_block
+    curl_total *= coupling
+    @inbounds for local_row in 1:3, local_col in 1:3
+        lhs_block[local_row, local_col] += dot(test_curls[local_row], trial_curls[local_col]) * curl_total
+    end
+    return lhs_block, rhs_block
 end
 
 function _beat_cpu_bm_regular_test!(
@@ -128,14 +175,14 @@ function _beat_cpu_bm_regular_test!(
     for trial_index in trial_indices
         trial_data = elements[trial_index]
         elements_are_adjacent(test_data.face, trial_data.face) && continue
-        single_block, adjoint_block, double_block, hyper_block = _beat_cpu_regular_pair_blocks(
+        lhs_block, rhs_block = _beat_cpu_bm_regular_pair_blocks(
             test_data, trial_data, test_quad, regular_quadrature[trial_index],
             dot(test_data.normal, trial_data.normal),
-            T(4.0) * test_data.area * trial_data.area, k,
+            T(4.0) * test_data.area * trial_data.area, k, coupling,
         )
-        _beat_cpu_bm_scatter_blocks!(
+        _beat_cpu_bm_scatter!(
             lhs, rhs, q_neumann, test_data.p1_dofs, trial_data.p1_dofs, trial_data.dp0_dof,
-            single_block, adjoint_block, double_block, hyper_block, coupling, Val(false),
+            lhs_block, rhs_block, Val(false),
         )
     end
     return nothing
@@ -149,14 +196,14 @@ function _beat_cpu_bm_regular_image_test!(
     test_quad = regular_quadrature[test_index]
     for trial_index in trial_indices
         trial_data = image_elements[trial_index]
-        single_block, adjoint_block, double_block, hyper_block = _beat_cpu_regular_pair_blocks(
+        lhs_block, rhs_block = _beat_cpu_bm_regular_pair_blocks(
             test_data, trial_data, test_quad, image_quadrature[trial_index],
             dot(test_data.normal, trial_data.normal),
-            T(4.0) * test_data.area * trial_data.area, k,
+            T(4.0) * test_data.area * trial_data.area, k, coupling,
         )
-        _beat_cpu_bm_scatter_blocks!(
+        _beat_cpu_bm_scatter!(
             lhs, rhs, q_neumann, test_data.p1_dofs, trial_data.p1_dofs, trial_data.dp0_dof,
-            single_block, adjoint_block, double_block, hyper_block, coupling, Val(false),
+            lhs_block, rhs_block, Val(false),
         )
     end
     return nothing
@@ -169,14 +216,14 @@ function _beat_cpu_bm_singular_test!(
         test_data = elements[pair.test_index]
         trial_data = elements[pair.trial_index]
         duffy = rules[pair.rule_index]
-        single_block, adjoint_block, double_block, hyper_block = _beat_cpu_bm_pair_blocks(
+        lhs_block, rhs_block = _beat_cpu_bm_pair_blocks(
             test_data.vertices, trial_data.vertices, test_data.normal, trial_data.normal,
-            test_data.curls, trial_data.curls, pair.normal_product, pair.jac_scale, k,
+            test_data.curls, trial_data.curls, pair.normal_product, pair.jac_scale, k, coupling,
             duffy.test_points, duffy.trial_points, duffy.weights,
         )
-        _beat_cpu_bm_scatter_blocks!(
+        _beat_cpu_bm_scatter!(
             lhs, rhs, q_neumann, test_data.p1_dofs, trial_data.p1_dofs, trial_data.dp0_dof,
-            single_block, adjoint_block, double_block, hyper_block, coupling, Val(false),
+            lhs_block, rhs_block, Val(false),
         )
     end
     return nothing
@@ -195,23 +242,23 @@ function _beat_cpu_bm_image_singular_delta_test!(
         test_data = elements[pair.test_index]
         trial_data = image_elements[pair.trial_index]
         duffy = rules[pair.rule_index]
-        single_block, adjoint_block, double_block, hyper_block = _beat_cpu_bm_pair_blocks(
+        lhs_block, rhs_block = _beat_cpu_bm_pair_blocks(
             test_data.vertices, trial_data.vertices, test_data.normal, trial_data.normal,
-            test_data.curls, trial_data.curls, pair.normal_product, pair.jac_scale, k,
+            test_data.curls, trial_data.curls, pair.normal_product, pair.jac_scale, k, coupling,
             duffy.test_points, duffy.trial_points, duffy.weights,
         )
-        _beat_cpu_bm_scatter_blocks!(
+        _beat_cpu_bm_scatter!(
             lhs, rhs, q_neumann, test_data.p1_dofs, trial_data.p1_dofs, trial_data.dp0_dof,
-            single_block, adjoint_block, double_block, hyper_block, coupling, Val(false),
+            lhs_block, rhs_block, Val(false),
         )
-        regular_single, regular_adjoint, regular_double, regular_hyper = _beat_cpu_regular_pair_blocks(
+        regular_lhs, regular_rhs = _beat_cpu_bm_regular_pair_blocks(
             test_data, trial_data, regular_quadrature[pair.test_index],
             image_quadrature[pair.trial_index], pair.normal_product,
-            T(4.0) * test_data.area * trial_data.area, k,
+            T(4.0) * test_data.area * trial_data.area, k, coupling,
         )
-        _beat_cpu_bm_scatter_blocks!(
+        _beat_cpu_bm_scatter!(
             lhs, rhs, q_neumann, test_data.p1_dofs, trial_data.p1_dofs, trial_data.dp0_dof,
-            regular_single, regular_adjoint, regular_double, regular_hyper, coupling, Val(true),
+            regular_lhs, regular_rhs, Val(true),
         )
     end
     return nothing
