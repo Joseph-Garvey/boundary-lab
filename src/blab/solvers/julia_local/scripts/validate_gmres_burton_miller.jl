@@ -37,10 +37,18 @@
 #  * Low-k conditioning. The uncapped Burton-Miller coupling `eta = i/k` grows
 #    without bound as k goes to zero, so the bottom of the band is hard. This
 #    dominates on well-resolved meshes: on the ATH ladder's A5 (5,107 dofs) the
-#    counts are 70 / 51 / 51 at 500 / 2000 / 6000 Hz.
+#    counts were 70 / 51 / 51 at 500 / 2000 / 6000 Hz, taken at the older 1e-6
+#    default and not re-measured since.
 #  * High kh. A coarse mesh runs out of elements per wavelength, so the top of
 #    the band is hard. This dominates here: on the bundled 1,390-dof sample the
-#    counts are 44 / 51 / 63 over the same frequencies -- the opposite ordering.
+#    counts are 32 / 38 / 39 over the same frequencies -- the opposite ordering.
+#
+# Those sample counts are the ones this gate now prints, and they are only
+# visible at the solver's own tolerance. Asked for 1e-6 the same three
+# frequencies report 53 / 58 / 55, which is not an iteration count at all: two
+# of the three never converge and 55 against 58 inverts the ordering the
+# paragraph above is about. A gate run at a tolerance the operator cannot reach
+# measures where three variants give up, not where they agree.
 #
 # So 6 kHz is this fixture's hard corner and 500 Hz is the ladder's. A gate at
 # mid-band alone would pass straight through either. Guarding the low-k
@@ -54,6 +62,8 @@
 #   BLAB_VALIDATE_SYMMETRY    off | x | xy
 #   BLAB_VALIDATE_DRIVES      independent drive columns (default 2)
 #   BLAB_VALIDATE_FREQUENCY_HZ  default 2000
+#   BLAB_VALIDATE_GMRES_AGREEMENT  default 1e-4
+#   BLAB_BEAT_GMRES_TOL       the solver's tolerance, which is also this gate's
 using LinearAlgebra, Printf, Random
 
 include(joinpath(@__DIR__, "..", "src", "BeatEngineCore.jl"))
@@ -76,7 +86,43 @@ function validate_gmres_burton_miller()
     regular_order = parse(Int, get(ENV, "BLAB_VALIDATE_REGULAR_ORDER", "4"))
     singular_order = parse(Int, get(ENV, "BLAB_VALIDATE_SINGULAR_ORDER", "4"))
     frequencies = Float32.(parse.(Float64, split(get(ENV, "BLAB_VALIDATE_FREQUENCY_HZ", "500,2000,6000"), ",")))
-    tolerance = parse(Float64, get(ENV, "BLAB_VALIDATE_GMRES_TOLERANCE", "1e-6"))
+    # The gate's tolerance is the solver's, read from it rather than restated
+    # here, and there is deliberately no way to set one without the other.
+    #
+    # It was restated once, as a literal 1e-6. When `_beat_gmres_tolerance`
+    # moved to 1e-5 the gate did not move with it, so it went on measuring a
+    # 1e-5 solve against a bound built from 1e-6 and failed six assertions on a
+    # solver that was doing exactly what it promised. A constant duplicated
+    # across a contract and its gate will drift, and the drift surfaces as a red
+    # gate rather than as a diff anyone reads. `tests/runtests.jl` pins the
+    # value itself; that is the one place a literal belongs, and this is not a
+    # second one.
+    #
+    # Reading the accessor also follows `BLAB_BEAT_GMRES_TOL`, so a run that
+    # moves the solver's tolerance is still gated against the number it actually
+    # solved at. Measured both ways on the bundled sample: at the 1e-5 default
+    # all three frequencies converge and meet the bound, and at
+    # `BLAB_BEAT_GMRES_TOL=1e-6` the 500 Hz and 2 kHz solves cannot reach the
+    # target, fall back to the LU as designed, and the gate passes on the
+    # fallback path instead. Green at both, red at neither.
+    #
+    # `BLAB_VALIDATE_GMRES_TOLERANCE` is retired rather than kept as an
+    # independent probe, because it could only ever move half of the gate. It
+    # set this bound and the `beat_gmres!` variants below, but not the
+    # `beat_solve_dense_system` call they exist to guard -- that call takes no
+    # tolerance keyword and reads the accessor. So the knob's entire remaining
+    # effect was to reintroduce the mismatch above on purpose: setting it to
+    # 1e-6 reproduces all six of those failures against a healthy solver. To
+    # probe a tolerance the product does not use, move the product's tolerance.
+    # `BLAB_BEAT_GMRES_TOL` moves the solve and the gate together, which is the
+    # only version of that probe that measures anything.
+    if !isempty(strip(get(ENV, "BLAB_VALIDATE_GMRES_TOLERANCE", "")))
+        error("BLAB_VALIDATE_GMRES_TOLERANCE is retired: it moved this gate's bound " *
+              "and its Krylov probes without moving the solve the gate checks, which " *
+              "is the drift this script now exists to prevent. Use BLAB_BEAT_GMRES_TOL " *
+              "to move the solver's tolerance and the gate with it.")
+    end
+    tolerance = Float64(BeatEngineCore._beat_gmres_tolerance(Float64))
     agreement_tolerance = parse(Float64, get(ENV, "BLAB_VALIDATE_GMRES_AGREEMENT", "1e-4"))
 
     mesh = load_gmsh22_with_tags(mesh_path, scale)
@@ -91,6 +137,7 @@ function validate_gmres_burton_miller()
     n = p1.global_dof_count
     println("fixture=$(mesh_path) scale=$(scale) symmetry=$(symmetry_mode)")
     println("faces=$(length(mesh.faces)) p1_dofs=$n frequencies=$(frequencies) drives=$(drive_count)")
+    println("gmres_tolerance=$(tolerance) (the solver's own) agreement_tolerance=$(agreement_tolerance)")
     flush(stdout)
 
     failures = String[]
@@ -155,12 +202,23 @@ function validate_gmres_burton_miller()
     # Recomputed independently of the solver, which evaluates `b - Ax` as one
     # fused gemv accumulating into b. Forming `Ax` in full and subtracting
     # afterwards cancels, and in Float32 that costs about sqrt(N) * eps of the
-    # result -- 1.1e-5 at 7,890 dofs, above the 1e-6 the solver is asked for.
-    # So the bound is the larger of the tolerance and that evaluation floor:
-    # below the floor this quantity is measuring Float32 subtraction, not the
-    # solve. The solver's own fused evaluation is the more accurate of the two,
-    # and the check that the answer is actually right is the agreement with the
-    # LU above, not this one.
+    # result -- 1.1e-5 at 7,890 dofs, at or above the tolerance the solver is
+    # asked for. So the bound is the larger of the tolerance and that evaluation
+    # floor: below the floor this quantity is measuring Float32 subtraction, not
+    # the solve. The solver's own fused evaluation is the more accurate of the
+    # two, and the check that the answer is actually right is the agreement with
+    # the LU above, not this one.
+    #
+    # Both terms have to come from the solve that was actually run. The floor
+    # does, because it is computed from this system's own n. The `4 * tolerance`
+    # term did not, while the tolerance was a literal here: at 1,390 dofs the
+    # floor is 4.44e-6 and a stale 1e-6 put its term at 4.0e-6, just under it,
+    # so the floor won and the bound looked defensible while measuring a 1e-5
+    # solve against 1e-6. Six failures, all of them the gate's arithmetic rather
+    # than the solver's. The floor was never the problem and must not be raised
+    # to absorb this -- it is a property of Float32 subtraction at this n, and
+    # moving it would hide the next real regression instead of the last stale
+    # constant.
     evaluation_floor = sqrt(Float64(n)) * eps(Float32)
     residual_bound = max(4 * tolerance, evaluation_floor)
     for drive in 1:drive_count
