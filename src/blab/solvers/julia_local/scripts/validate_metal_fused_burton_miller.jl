@@ -10,8 +10,18 @@
 #
 #   BLAB_VALIDATE_MESH_PATH   absolute mesh path (default: the bundled sample)
 #   BLAB_VALIDATE_SCALE       mesh scale (default 0.001 for the sample)
-#   BLAB_VALIDATE_SYMMETRY    off | x | xy
+#   BLAB_VALIDATE_SYMMETRY    comma-separated arms of off | x | xy | ground
+#                             (default `off,x,ground`; every arm is run and the
+#                             script fails if any of them fails)
 #   BLAB_VALIDATE_DRIVES      number of independent drive columns (default 2)
+#
+# `xy` is deliberately not in the default arm list. On the bundled sample that
+# combination fails `pressure_relative_error` on unmodified code, and two runs
+# of the same tree disagree by ~2x: the operators agree to 1e-7 and the LU of
+# the symmetry-reduced matrix amplifies the atomic-accumulation
+# non-determinism of the singular scatter into 1e-5. It is a property of that
+# fixture at that symmetry, not of the assembly path, and it is reproducible on
+# a tree with no local changes. Run `BLAB_VALIDATE_SYMMETRY=xy` to reproduce it.
 using LinearAlgebra, Random
 
 include(joinpath(@__DIR__, "..", "src", "BeatEngineCore.jl"))
@@ -22,7 +32,7 @@ function relative_error(actual, reference)
     return norm(actual - reference) / denominator
 end
 
-function validate_metal_fused_burton_miller()
+function validate_metal_fused_burton_miller(symmetry_mode::Symbol)
     metal = BeatEngineCore.METAL_MODULE
     metal === nothing && error("Metal.jl did not load. Run this script with the julia_metal project.")
     metal.functional() || error("Metal.functional() is false.")
@@ -32,7 +42,6 @@ function validate_metal_fused_burton_miller()
     if isempty(mesh_path)
         mesh_path = joinpath(@__DIR__, "..", "test_meshes", get(ENV, "BLAB_VALIDATE_MESH", "sample.msh"))
     end
-    symmetry_mode = Symbol(get(ENV, "BLAB_VALIDATE_SYMMETRY", "off"))
     drive_count = parse(Int, get(ENV, "BLAB_VALIDATE_DRIVES", "2"))
     regular_order = parse(Int, get(ENV, "BLAB_VALIDATE_REGULAR_ORDER", "4"))
     singular_order = parse(Int, get(ENV, "BLAB_VALIDATE_SINGULAR_ORDER", "4"))
@@ -126,12 +135,32 @@ function validate_metal_fused_burton_miller()
     rhs_error <= operator_tolerance || push!(failures, "rhs_relative_error $(rhs_error) > $(operator_tolerance)")
     pressure_error <= operator_tolerance || push!(failures, "pressure_relative_error $(pressure_error) > $(operator_tolerance)")
     if isempty(failures)
-        println("RESULT=pass")
+        println("ARM_RESULT symmetry=$(symmetry_mode) pass")
         return 0
     end
     for failure in failures
-        println("FAILURE: $(failure)")
+        println("FAILURE: symmetry=$(symmetry_mode) $(failure)")
     end
+    println("ARM_RESULT symmetry=$(symmetry_mode) fail")
+    return 1
+end
+
+function validate_metal_fused_burton_miller()
+    arms = [Symbol(strip(arm)) for arm in split(get(ENV, "BLAB_VALIDATE_SYMMETRY", "off,x,ground"), ",")
+            if !isempty(strip(arm))]
+    isempty(arms) && error("BLAB_VALIDATE_SYMMETRY named no symmetry arm.")
+    failed = Symbol[]
+    for arm in arms
+        println("=== symmetry arm: $(arm)")
+        validate_metal_fused_burton_miller(arm) == 0 || push!(failed, arm)
+        flush(stdout)
+    end
+    println("arms=$(join(arms, ","))")
+    if isempty(failed)
+        println("RESULT=pass")
+        return 0
+    end
+    println("failed_arms=$(join(failed, ","))")
     println("RESULT=fail")
     return 1
 end

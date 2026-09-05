@@ -104,9 +104,27 @@ are evaluated whatever they accumulate into. Only the expansion collapses, and
 only because the hypersingular curl term carries no basis product and can be
 summed as one scalar and expanded after the loop.
 
+The singular correction is fused the same way and for the same reason. The
+Duffy/Sauter-Schwab pair carried 50 live accumulator floats and expanded the
+rank-1 outer product four times per quadrature point pair; combining inside the
+loop and hoisting the loop-invariant curl term leaves 26 live floats and two
+expansions. The singular block kernel is **2.7x** faster on both an M1 Max
+1,209-dof symmetry-reduced mesh (20.7 to 7.7 ms) and a 4,552-dof full mesh
+(84.1 to 30.9 ms), for a 14-17% shorter assembly and a 11-14% shorter
+40-frequency sweep. Device memory high-water is unchanged to the byte: the
+kernel writes the same `pair_count x part_count x 12` complex scratch through
+the same scatter kernel.
+
+`_metal_singular_pair_blocks` in `BeatEngineMetalAtomicKernels.jl` is the
+four-operator path's singular pair and is deliberately untouched by the fusion,
+so it stays an independent reference rather than a copy of the code under test.
+
 `scripts/validate_metal_fused_burton_miller.jl` gates it by comparing the fused
 system against the four-operator system on the same mesh, frequency and
 quadrature, where the two differ only by float32 summation order.
+`scripts/validate_metal_singular_summation.jl` bounds that summation-order
+difference directly, per singular pair, against a Float64 evaluation of the
+same algebra.
 
 The Burton-Miller right-hand side is applied matrix-free. The operator
 `-S - (i/k)(K' + 0.5 M)` is N x 2N complex -- 1.67 GB at 10,230 P1 dofs -- and
@@ -231,7 +249,8 @@ CPU-versus-Metal validation scripts:
 
 | Script | Coverage |
 |---|---|
-| `validate_metal_fused_burton_miller.jl` | Fused exterior system against the four-operator system, symmetry off/x/xy, multi-drive |
+| `validate_metal_fused_burton_miller.jl` | Fused exterior system against the four-operator system, multi-drive. `BLAB_VALIDATE_SYMMETRY` is a comma-separated arm list; the default runs `off,x,ground` and fails if any arm fails. |
+| `validate_metal_singular_summation.jl` | The fused singular pair against the four-operator accumulation order, per pair, in Float32 against a Float64 reference: the two orders must agree in Float64, neither Float32 order may exceed the stated bound, and the fused order must not be systematically worse. |
 | `validate_gmres_burton_miller.jl` | GMRES against the dense LU on a real assembled operator across the frequency band: true residual, three-way agreement between Krylov variants, restart independence, and that the failure mode the remedies cover is reachable. |
 | `validate_metal_exterior.jl` | Operators (both singular modes), boundary pressure, residual, and exterior field for an exterior solve. |
 | `validate_metal_symmetry.jl` | X and XY reduced-domain assembly and solve parity, both singular modes. |
@@ -262,3 +281,22 @@ CPU-versus-Metal differences exceed their tolerances.
   is multithreaded, and two runs of the same solve differ by about 3e-7
   relative in the exterior field. Golden-file comparisons belong on the CPU
   `reference` path, tolerance comparisons everywhere else.
+
+## Known issue: the fused Burton-Miller gate at symmetry `xy`
+
+`validate_metal_fused_burton_miller.jl` run with `BLAB_VALIDATE_SYMMETRY=xy` on
+the bundled `sample.msh` fails `pressure_relative_error` at about 1e-5 against
+the script's 5e-6 tolerance, and it fails **non-deterministically**: three runs
+of the same tree spread over 2x (1.27e-5 to 2.29e-5) while their `lhs` and
+`rhs` errors match to three digits at 1e-7.
+
+So it is not an operator defect. The operators agree; the LU of the
+symmetry-reduced matrix at that fixture amplifies the atomic-accumulation
+non-determinism of the singular scatter (`BLAB_METAL_SINGULAR_MODE=host`
+removes the atomics) into the pressure. It reproduces on a tree with no local
+changes and predates the singular fusion.
+
+`xy` is therefore not in the script's default arm list, and closing it means
+either a better-conditioned `xy` fixture or a deterministic singular scatter —
+not a wider tolerance. `off`, `x` and `ground` all pass, and the `xy` arm is
+still one `BLAB_VALIDATE_SYMMETRY=xy` away for anyone working on it.

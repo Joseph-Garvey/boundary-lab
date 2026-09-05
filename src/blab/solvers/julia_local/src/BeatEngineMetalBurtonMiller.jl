@@ -124,21 +124,13 @@ function _release_metal_fused_gather_tables!(cache::MetalRegularAssemblyCache)
     return nothing
 end
 
-# lhs contribution of a pair: -D + (i/k) H, so
-#   re = -D_re - H_im / k      im = -D_im + H_re / k
-# rhs coefficient of a pair: -S - (i/k) K', so
-#   re = -S_re + K'_im / k     im = -S_im - K'_re / k
-# Identical algebra to `burton_miller_neumann_matrices`, formed per pair.
-@inline function _metal_fused_pair_combination(
-    slp_re, slp_im, adj_re, adj_im, dlp_re, dlp_im, hyp_re, hyp_im, inverse_k,
-)
-    lhs_re = -dlp_re - inverse_k * hyp_im
-    lhs_im = -dlp_im + inverse_k * hyp_re
-    rhs_re = -slp_re + inverse_k * adj_im
-    rhs_im = -slp_im - inverse_k * adj_re
-    return lhs_re, lhs_im, rhs_re, rhs_im
-end
-
+# Both fused pair kernels form the same algebra as `burton_miller_neumann_matrices`,
+# per pair and inside the accumulation:
+#   lhs contribution of a pair: -D + (i/k) H, so
+#     re = -D_re - H_im / k      im = -D_im + H_re / k
+#   rhs coefficient of a pair: -S - (i/k) K', so
+#     re = -S_re + K'_im / k     im = -S_im - K'_re / k
+#
 # The pair's Burton-Miller contribution, combined inside the accumulation
 # rather than after it.
 #
@@ -593,6 +585,144 @@ end
 # the same eta before the scatter. Getting this wrong is silent, so the
 # equivalence gate compares a fused assembly against a four-operator one on the
 # same mesh and frequency rather than trusting the validation tolerances.
+#
+# The combination is formed inside the Duffy quadrature loop rather than after
+# it -- what `_metal_regular_pair_fused_blocks` already does for the regular
+# kernel, and for the same two reasons.
+#
+# `_metal_singular_pair_blocks`, which the four-operator path still uses,
+# carries 50 live accumulator floats through the loop (slp 3+3, adj 3+3,
+# dlp 9+9, hb 9+9, g_total 1+1) and expands the rank-1 `outer` product four
+# times per point pair. The Burton-Miller combination is linear, so it can be
+# applied to the per-point scalars before the expansion: two 3x3 expansions
+# instead of four, one 3x1 instead of two, and 26 live floats.
+#
+# The hypersingular curl term is loop-invariant (H is curl_products * G0 minus
+# the basis-weighted part), so it is added once after the loop exactly as the
+# regular kernel adds it. The remaining `g_total` pair is what carries it.
+#
+# Summation order therefore differs from `_metal_singular_pair_blocks` in
+# Float32 -- which is what the fused-versus-four-operator equivalence gate
+# measures, and why the four-operator path is left untouched as the reference.
+# `scripts/validate_metal_singular_summation.jl` bounds that difference
+# directly, per pair, against a Float64 evaluation of the same algebra.
+#
+# The per-pair algebra is `burton_miller_neumann_matrices` formed per pair:
+#   lhs contribution: -D + (i/k) H, so re = -D_re - H_im / k, im = -D_im + H_re / k
+#   rhs coefficient:  -S - (i/k) K', so re = -S_re + K'_im / k, im = -S_im - K'_re / k
+@inline function _metal_singular_pair_fused_bm_blocks(
+    linear_index::Int32,
+    test_indices,
+    trial_indices,
+    rule_indices,
+    jac_scales,
+    normal_products,
+    rule_offsets,
+    rule_test_points,
+    rule_trial_points,
+    rule_weights,
+    face_vertices,
+    normals,
+    curls,
+    k,
+    inverse_k,
+    face_count::Int32,
+    pair_count::Int32,
+    rule_point_count::Int32,
+    part_count::Int32,
+    trial_sign_x,
+    trial_sign_y,
+    trial_sign_z,
+    trial_curl_sign_x,
+    trial_curl_sign_y,
+    trial_curl_sign_z,
+)
+    pair_position = (linear_index - Int32(1)) % pair_count + Int32(1)
+    part = (linear_index - Int32(1)) ÷ pair_count + Int32(1)
+    T = typeof(k)
+    @inbounds begin
+        test_index = Int32(test_indices[pair_position])
+        trial_index = Int32(trial_indices[pair_position])
+        rule_index = Int32(rule_indices[pair_position])
+        q_first = Int32(rule_offsets[rule_index])
+        q_last = Int32(rule_offsets[rule_index + Int32(1)]) - Int32(1)
+        per_part = cld(q_last - q_first + Int32(1), part_count)
+        q = q_first + (part - Int32(1)) * per_part
+        q_stop = min(q + per_part - Int32(1), q_last)
+        jac_scale = jac_scales[pair_position]
+        normal_product = normal_products[pair_position]
+        test_nx = normals[test_index]
+        test_ny = normals[test_index + face_count]
+        test_nz = normals[test_index + Int32(2) * face_count]
+        trial_nx = trial_sign_x * normals[trial_index]
+        trial_ny = trial_sign_y * normals[trial_index + face_count]
+        trial_nz = trial_sign_z * normals[trial_index + Int32(2) * face_count]
+    end
+    inv_four_pi = T(0.07957747154594767)
+    # -(i/k) * k^2 (n.n'), folded into the per-point combination.
+    curl_scale = inverse_k * k * k * normal_product
+    lhs_re = zero(SVector{9,T}); lhs_im = zero(SVector{9,T})
+    rhs_re = zero(SVector{3,T}); rhs_im = zero(SVector{3,T})
+    g_total_re = zero(T); g_total_im = zero(T)
+    while q <= q_stop
+        @inbounds begin
+            test_xi = rule_test_points[q]
+            test_eta = rule_test_points[q + rule_point_count]
+            trial_xi = rule_trial_points[q]
+            trial_eta = rule_trial_points[q + rule_point_count]
+            weight = rule_weights[q] * jac_scale
+        end
+        tb1 = one(k) - test_xi - test_eta
+        rb1 = one(k) - trial_xi - trial_eta
+        x, y, z = _metal_face_point(face_vertices, test_index, face_count, tb1, test_xi, test_eta)
+        sx, sy, sz = _metal_face_point(face_vertices, trial_index, face_count, rb1, trial_xi, trial_eta)
+        Base.@fastmath begin
+            dx = sx * trial_sign_x - x
+            dy = sy * trial_sign_y - y
+            dz = sz * trial_sign_z - z
+            radius2 = dx * dx + dy * dy + dz * dz
+            if radius2 > zero(k)
+                inv_radius = _metal_fast_rsqrt(radius2)
+                radius = radius2 * inv_radius
+                phase = k * radius
+                green_scale = inv_radius * inv_four_pi * weight
+                green_re = _metal_fast_cos(phase) * green_scale
+                green_im = _metal_fast_sin(phase) * green_scale
+                grad_re = -green_re * inv_radius - green_im * k
+                grad_im = green_re * k - green_im * inv_radius
+                test_dot = -(dx * test_nx + dy * test_ny + dz * test_nz) * inv_radius
+                trial_dot = (dx * trial_nx + dy * trial_ny + dz * trial_nz) * inv_radius
+                tb = SVector(tb1, test_xi, test_eta)
+                outer = SVector(
+                    tb1 * rb1, test_xi * rb1, test_eta * rb1,
+                    tb1 * trial_xi, test_xi * trial_xi, test_eta * trial_xi,
+                    tb1 * trial_eta, test_xi * trial_eta, test_eta * trial_eta,
+                )
+                # rhs coefficient: -S - (i/k) K'
+                rhs_re += tb * (-green_re + inverse_k * (grad_im * test_dot))
+                rhs_im += tb * (-green_im - inverse_k * (grad_re * test_dot))
+                # lhs: -D + (i/k) H, less the loop-invariant curl term.
+                u_re = -(grad_re * trial_dot) + curl_scale * green_im
+                u_im = -(grad_im * trial_dot) - curl_scale * green_re
+                lhs_re += outer * u_re
+                lhs_im += outer * u_im
+                g_total_re += green_re
+                g_total_im += green_im
+            end
+        end
+        q += Int32(1)
+    end
+    # (i/k) * curl_products * G0, added after the loop so its nine values are
+    # not live registers during it.
+    curl_products = _metal_pair_curl_products(
+        curls, test_index, trial_index, face_count,
+        trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z,
+    )
+    lhs_re -= curl_products * (inverse_k * g_total_im)
+    lhs_im += curl_products * (inverse_k * g_total_re)
+    return lhs_re, lhs_im, rhs_re, rhs_im
+end
+
 function _metal_singular_fused_bm_blocks_kernel!(
     lhs_values,
     rhs_values,
@@ -623,16 +753,14 @@ function _metal_singular_fused_bm_blocks_kernel!(
 )
     linear_index = Int32(thread_position_in_grid_1d())
     linear_index > pair_count * part_count && return nothing
-    slp_re, slp_im, adj_re, adj_im, dlp_re, dlp_im, hyp_re, hyp_im = _metal_singular_pair_blocks(
+    lhs_re, lhs_im, rhs_re, rhs_im = _metal_singular_pair_fused_bm_blocks(
         linear_index,
         test_indices, trial_indices, rule_indices, jac_scales, normal_products,
         rule_offsets, rule_test_points, rule_trial_points, rule_weights,
-        face_vertices, normals, curls, k, face_count, pair_count, rule_point_count, part_count,
+        face_vertices, normals, curls, k, inverse_k,
+        face_count, pair_count, rule_point_count, part_count,
         trial_sign_x, trial_sign_y, trial_sign_z,
         trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z,
-    )
-    lhs_re, lhs_im, rhs_re, rhs_im = _metal_fused_pair_combination(
-        slp_re, slp_im, adj_re, adj_im, dlp_re, dlp_im, hyp_re, hyp_im, inverse_k,
     )
     value_stride = pair_count * part_count
     @inbounds begin
