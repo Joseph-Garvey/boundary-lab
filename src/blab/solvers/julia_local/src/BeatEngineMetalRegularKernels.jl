@@ -147,6 +147,12 @@ function _metal_regular_slp_adjoint_entries_kernel!(
                         inv_radius = one(k) / radius
                         phase = k * radius
                         green_scale = inv_radius / four_pi
+                        # Very small change - but would it be worthwhile using fast math (green_cos) here?
+                        # In my testing it still passes all correctness tests with the exception of of validate_metal_exterior.jl
+                        # fails above 4khz, worst value was 4e-6 compared to 1e-6 tolerance.
+                        # in testing on real examples, speedup was 1-2%
+                        # error is 5.5x worse at 20k but is swamped by other errors (eg float32 conditioning)
+                        # pressure error ends up only 2% different in the end. 
                         green_re = cos(phase) * green_scale
                         green_im = sin(phase) * green_scale
                         weight = test_weight * rule_weights[trial_q] * jac_scale * test_basis
