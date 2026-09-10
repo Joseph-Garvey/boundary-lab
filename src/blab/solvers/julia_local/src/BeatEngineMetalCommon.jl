@@ -41,6 +41,34 @@ struct MetalSingularCorrectionCache{T}
     rule_trial_points
     rule_weights
     pair_count::Int
+    gather_tables::Ref{Any}   # MetalSingularGatherTables, built lazily by the deterministic write-back
+end
+
+# One deterministic write-back map. `entry_indices` lists every dense-matrix cell
+# the singular correction touches, once, in ascending order. `contrib_offsets` is
+# the CSR row start for each of them, and `contrib_values` holds the block-value
+# index of each contribution at `part == 1`; the kernel reaches the remaining
+# parts by adding `pair_count` repeatedly, so the map does not grow with the part
+# split. One thread owns one cell, so the adds need no atomics and always happen
+# in the same order.
+struct MetalSingularGatherMap
+    entry_indices
+    contrib_offsets
+    contrib_values
+    contrib_columns   # nothing, or each contribution's DP0 column (fused right-hand side only)
+    entry_count::Int
+end
+
+# The three maps a singular cache needs, built together in one host pass.
+# `part_count` and the regular cache are part of the key: the value indices
+# depend on the part split, and the destination indices depend on the mesh the
+# regular cache was built for.
+struct MetalSingularGatherTables
+    p1_dp0::MetalSingularGatherMap   # single layer and adjoint double layer
+    p1_p1::MetalSingularGatherMap    # double layer, hypersingular, and the fused left-hand side
+    rhs::MetalSingularGatherMap      # the fused right-hand side
+    part_count::Int
+    regular_id::UInt
 end
 
 struct MetalRegularAssemblyCache{T,C}
@@ -139,6 +167,19 @@ function _normalized_metal_singular_mode(value=nothing)
     normalized = get(aliases, mode, nothing)
     normalized === nothing && error("BLAB_METAL_SINGULAR_MODE must be native or host; got $(value).")
     return normalized
+end
+
+# The singular blocks are evaluated once and then written into the operators
+# either by an atomic scatter (one thread per pair, contended cells) or by a
+# gather (one thread per touched cell, no contention). Only the gather is
+# reproducible run to run, so it is the default; `scatter` is kept so the two can
+# be compared on the same tree.
+function _normalized_metal_singular_writeback(value=nothing)
+    value === nothing && (value = get(ENV, "BLAB_METAL_SINGULAR_WRITEBACK", "gather"))
+    mode = Symbol(lowercase(strip(String(value))))
+    mode in (:gather, :scatter) ||
+        error("BLAB_METAL_SINGULAR_WRITEBACK must be gather or scatter; got $(value).")
+    return mode
 end
 
 @inline function _metal_global_linear_index()

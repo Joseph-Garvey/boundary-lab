@@ -672,6 +672,11 @@ function _launch_metal_singular_block_scatter_kernels!(
     csz = typeof(k)(transform.determinant * transform.signs[3])
     rule_point_count = length(singular_cache.rule_weights)
     part_count = _metal_singular_part_count()
+    # Resolved before the block kernel launches: building the map on the first
+    # call reads the pair list back to the host, and doing that between the two
+    # launches would stall the queue for nothing.
+    gather_tables = _normalized_metal_singular_writeback() == :gather ?
+        _metal_singular_gather_tables(regular_cache, singular_cache, part_count) : nothing
     value_count = pair_count * part_count
     slp_values = Metal.zeros(eltype(operators.single_layer), value_count, 3)
     adjoint_values = Metal.zeros(eltype(operators.adjoint_double_layer), value_count, 3)
@@ -688,18 +693,42 @@ function _launch_metal_singular_block_scatter_kernels!(
         k, Int32(regular_cache.face_count), Int32(pair_count), Int32(rule_point_count), Int32(part_count),
         sx, sy, sz, csx, csy, csz,
     )
-    _metal_launch(
-        _metal_singular_block_scatter_kernel!,
-        pair_count,
-        reinterpret(Float32, operators.single_layer),
-        reinterpret(Float32, operators.adjoint_double_layer),
-        reinterpret(Float32, operators.double_layer),
-        reinterpret(Float32, operators.hypersingular),
-        slp_values, adjoint_values, dlp_values, hypersingular_values,
-        singular_cache.test_indices, singular_cache.trial_indices,
-        regular_cache.p1_dofs, regular_cache.element_dp0_dofs,
-        pair_count, part_count, regular_cache.p1_dof_count, regular_cache.face_count,
-    )
+    if gather_tables === nothing
+        _metal_launch(
+            _metal_singular_block_scatter_kernel!,
+            pair_count,
+            reinterpret(Float32, operators.single_layer),
+            reinterpret(Float32, operators.adjoint_double_layer),
+            reinterpret(Float32, operators.double_layer),
+            reinterpret(Float32, operators.hypersingular),
+            slp_values, adjoint_values, dlp_values, hypersingular_values,
+            singular_cache.test_indices, singular_cache.trial_indices,
+            regular_cache.p1_dofs, regular_cache.element_dp0_dofs,
+            pair_count, part_count, regular_cache.p1_dof_count, regular_cache.face_count,
+        )
+    else
+        # One thread per touched cell instead of one per pair: no atomics, and
+        # the same tree gives the same operators on every run. The two operators
+        # in each launch share a destination, so the map is walked once for both.
+        row_map = gather_tables.p1_dp0
+        _metal_launch(
+            _metal_singular_pair_gather_kernel!,
+            row_map.entry_count,
+            operators.single_layer, operators.adjoint_double_layer,
+            slp_values, adjoint_values,
+            row_map.entry_indices, row_map.contrib_offsets, row_map.contrib_values,
+            row_map.entry_count, pair_count, part_count,
+        )
+        block_map = gather_tables.p1_p1
+        _metal_launch(
+            _metal_singular_pair_gather_kernel!,
+            block_map.entry_count,
+            operators.double_layer, operators.hypersingular,
+            dlp_values, hypersingular_values,
+            block_map.entry_indices, block_map.contrib_offsets, block_map.contrib_values,
+            block_map.entry_count, pair_count, part_count,
+        )
+    end
     Metal.synchronize()
     Metal.unsafe_free!(slp_values)
     Metal.unsafe_free!(adjoint_values)

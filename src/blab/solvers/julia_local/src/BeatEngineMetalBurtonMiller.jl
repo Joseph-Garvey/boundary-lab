@@ -869,6 +869,10 @@ function _launch_metal_fused_singular_kernels!(
     csz = T(transform.determinant * transform.signs[3])
     rule_point_count = length(singular_cache.rule_weights)
     part_count = _metal_singular_part_count()
+    # Same maps the four-operator path uses: the fused left-hand side lands on
+    # the same P1-row/P1-column cells as the double layer and hypersingular.
+    gather_tables = _normalized_metal_singular_writeback() == :gather ?
+        _metal_singular_gather_tables(regular_cache, singular_cache, part_count) : nothing
     value_count = pair_count * part_count
     lhs_values = Metal.zeros(eltype(lhs), value_count, 9)
     rhs_values = Metal.zeros(eltype(lhs), value_count, 3)
@@ -884,25 +888,48 @@ function _launch_metal_fused_singular_kernels!(
         Int32(rule_point_count), Int32(part_count),
         sx, sy, sz, csx, csy, csz,
     )
-    _metal_launch(
-        _metal_singular_fused_bm_scatter_kernel!,
-        pair_count,
-        reinterpret(T, lhs),
-        reinterpret(T, rhs),
-        lhs_values,
-        rhs_values,
-        q_neumann,
-        singular_cache.test_indices,
-        singular_cache.trial_indices,
-        regular_cache.p1_dofs,
-        regular_cache.element_dp0_dofs,
-        pair_count,
-        part_count,
-        regular_cache.p1_dof_count,
-        regular_cache.dp0_dof_count,
-        size(q_neumann, 2),
-        regular_cache.face_count,
-    )
+    if gather_tables === nothing
+        _metal_launch(
+            _metal_singular_fused_bm_scatter_kernel!,
+            pair_count,
+            reinterpret(T, lhs),
+            reinterpret(T, rhs),
+            lhs_values,
+            rhs_values,
+            q_neumann,
+            singular_cache.test_indices,
+            singular_cache.trial_indices,
+            regular_cache.p1_dofs,
+            regular_cache.element_dp0_dofs,
+            pair_count,
+            part_count,
+            regular_cache.p1_dof_count,
+            regular_cache.dp0_dof_count,
+            size(q_neumann, 2),
+            regular_cache.face_count,
+        )
+    else
+        # One thread per touched cell, no atomics, fixed summation order. This is
+        # the path the fused Burton-Miller gate depends on for reproducibility.
+        block_map = gather_tables.p1_p1
+        _metal_launch(
+            _metal_singular_entry_gather_kernel!,
+            block_map.entry_count,
+            lhs, lhs_values,
+            block_map.entry_indices, block_map.contrib_offsets, block_map.contrib_values,
+            block_map.entry_count, pair_count, part_count,
+        )
+        rhs_map = gather_tables.rhs
+        _metal_launch(
+            _metal_singular_rhs_gather_kernel!,
+            rhs_map.entry_count,
+            rhs, rhs_values, q_neumann,
+            rhs_map.entry_indices, rhs_map.contrib_offsets,
+            rhs_map.contrib_values, rhs_map.contrib_columns,
+            rhs_map.entry_count, pair_count, part_count,
+            regular_cache.p1_dof_count, regular_cache.dp0_dof_count, size(q_neumann, 2),
+        )
+    end
     Metal.synchronize()
     Metal.unsafe_free!(lhs_values)
     Metal.unsafe_free!(rhs_values)

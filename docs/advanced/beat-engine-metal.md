@@ -163,8 +163,27 @@ read from cached device arrays rather than hoisted into registers.
 The singular corrections use one fused Duffy kernel per (pair, part) that
 evaluates the Green's function once per point pair for all four operators;
 a pair's rule (512 to 1536 point pairs at singular order 4) is split into
-`BLAB_METAL_SINGULAR_PARTS` contiguous ranges and a scatter kernel sums the
-parts with atomics (about 48 per pair, negligible).
+`BLAB_METAL_SINGULAR_PARTS` contiguous ranges. A second kernel then sums the
+parts and adds them to the operators. By default that is a gather: one thread
+owns one dense-matrix cell and reads the list of block values belonging to it
+from a map built on the host once per mesh, so no two threads share a cell and
+the summation order is fixed. `BLAB_METAL_SINGULAR_WRITEBACK=scatter` selects
+the older write-back instead, one thread per pair adding about 48 atomics, which
+is not reproducible.
+
+The map costs one host pass per mesh and is then reused for the worker's
+lifetime, like the caches it hangs off. On an M1 Pro at `sample.msh` (2,776
+faces, 37,198 singular pairs) it takes 269 ms to build and 3.0 MB of device
+memory; at `sample_detailed.msh` (7,000 faces, 93,740 pairs) 637 ms and 7.7 MB.
+In exchange the four-operator write-back drops from 2,249,760 atomic adds to
+311,964 plain ones at the larger mesh, because a corrected cell is written once
+instead of once per pair that touches it (3.2 pairs per cell for the single
+layer and adjoint, 12.2 for the double layer and hypersingular).
+
+Warm, the two write-backs are within a few percent of each other and the
+singular stage is under a tenth of assembly, so this is not a speed change. A
+single-frequency run on a fresh mesh is slightly slower for the map build; a
+sweep amortizes it away.
 
 On an M1 Max at 5,041 P1 dofs (10,078 faces), quadrature order 4, singular
 order 4, one frequency: `pair_gather` assembles in about 1.06 s (pair
@@ -218,6 +237,7 @@ Normal application use does not require these environment variables.
 | `BLAB_METAL_GATHER_BUDGET_MB` | `512` | Device memory for the pair-block buffer; sets the trial chunk size of `pair_gather`. `BLAB_METAL_GATHER_CHUNK` overrides the chunk size directly. |
 | `BLAB_METAL_GATHER_TIMING` | `0` | Set to `1` to synchronize after each `pair_gather` stage and report `metal_native_gather_*` timings (slower). |
 | `BLAB_METAL_SINGULAR_PARTS` | `4` | Ranges each singular pair's Duffy rule is split into across threads. |
+| `BLAB_METAL_SINGULAR_WRITEBACK` | `gather` | How the singular blocks reach the operators. `gather` owns one dense cell per thread and is reproducible; `scatter` is the older one-thread-per-pair atomic write-back, kept for comparison. |
 | `BLAB_METAL_OPERATOR_STORAGE` | `shared` | Use `private` to allocate the operator matrices in private storage and copy them to the host, the pre-2026-09-02 behavior. |
 | `BLAB_METAL_PIPELINE` | `1` | Set to `0` to assemble and solve each sweep frequency sequentially instead of overlapping GPU assembly with the CPU factorization. |
 | `BLAB_METAL_ATOMIC_SCATTER` | `1` | Diagnostic for `pair_atomic` only: `0` skips the atomic scatter to time the pair arithmetic (the operators are then wrong). |
@@ -277,6 +297,11 @@ CPU-versus-Metal differences exceed their tolerances.
 - The default `pair_gather` kernels are bitwise reproducible run to run, as
   are `pair_owned` and `entry_owned`. `pair_atomic` is not (atomic
   accumulation order); its differences are float32 summation noise.
+- That holds for the singular stage as well, but only since the deterministic
+  write-back landed. Before it, every mode routed its singular corrections
+  through an atomic scatter, so nothing was actually reproducible.
+  `BLAB_METAL_SINGULAR_WRITEBACK=scatter` restores the old behavior for
+  comparison.
 - Assembly being reproducible does not make a sweep reproducible: the CPU LU
   is multithreaded, and two runs of the same solve differ by about 3e-7
   relative in the exterior field. Golden-file comparisons belong on the CPU
@@ -285,18 +310,32 @@ CPU-versus-Metal differences exceed their tolerances.
 ## Known issue: the fused Burton-Miller gate at symmetry `xy`
 
 `validate_metal_fused_burton_miller.jl` run with `BLAB_VALIDATE_SYMMETRY=xy` on
-the bundled `sample.msh` fails `pressure_relative_error` at about 1e-5 against
-the script's 5e-6 tolerance, and it fails **non-deterministically**: three runs
-of the same tree spread over 2x (1.27e-5 to 2.29e-5) while their `lhs` and
-`rhs` errors match to three digits at 1e-7.
+the bundled `sample.msh` fails `pressure_relative_error` at about 2e-5 against
+the script's 5e-6 tolerance, while its `lhs` and `rhs` errors sit at 1.4e-7 and
+9.7e-7. So it is not an operator defect: the operators agree, and the LU of the
+symmetry-reduced matrix at that fixture amplifies the remaining difference by
+about twenty times into the pressure. `off`, `x` and `ground` amplify by three
+to five times on the same fixture and pass.
 
-So it is not an operator defect. The operators agree; the LU of the
-symmetry-reduced matrix at that fixture amplifies the atomic-accumulation
-non-determinism of the singular scatter (`BLAB_METAL_SINGULAR_MODE=host`
-removes the atomics) into the pressure. It reproduces on a tree with no local
-changes and predates the singular fusion.
+This used to fail **non-deterministically** as well, and the earlier note here
+blamed the atomic singular scatter and proposed a deterministic scatter as one
+of the two possible fixes. The first half of that was right; the second was not.
+Measured on an M1 Pro, `sample.msh`, three runs each:
 
-`xy` is therefore not in the script's default arm list, and closing it means
-either a better-conditioned `xy` fixture or a deterministic singular scatter —
-not a wider tolerance. `off`, `x` and `ground` all pass, and the `xy` arm is
-still one `BLAB_VALIDATE_SYMMETRY=xy` away for anyone working on it.
+| write-back | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| `scatter` (atomics) | 2.3376e-5 | 1.7533e-5 | 2.1780e-5 |
+| `gather` (default) | 1.6459548e-5 | 1.6459548e-5 | 1.6459548e-5 |
+
+The deterministic write-back exists now and it removed the run-to-run spread
+completely, but the arm still fails. The atomics were adding roughly plus or
+minus thirty percent of noise on top of a real error near 1.6e-5, which is
+already three times the tolerance. Changing the summation order to another valid
+fixed order moves the number inside the same 1.4e-5 to 2.6e-5 band, which is
+what float32 sensitivity amplified by this fixture's conditioning looks like.
+
+So `xy` remains out of the script's default arm list, and closing it needs a
+better-conditioned `xy` fixture, or a tolerance argued from the conditioning
+rather than picked. It is not a write-back problem and no further work on the
+kernels will close it. The arm is still one `BLAB_VALIDATE_SYMMETRY=xy` away for
+anyone working on it.

@@ -63,6 +63,7 @@ function build_metal_singular_correction_cache(cache::SingularCorrectionCache{T}
         MtlArray(rule_trial_points),
         MtlArray(rule_weights),
         cache.pair_count,
+        Ref{Any}(nothing),
     )
 end
 
@@ -77,6 +78,331 @@ function release_metal_singular_correction_cache!(cache::MetalSingularCorrection
     Metal.unsafe_free!(cache.rule_test_points)
     Metal.unsafe_free!(cache.rule_trial_points)
     Metal.unsafe_free!(cache.rule_weights)
+    tables = cache.gather_tables[]
+    tables isa MetalSingularGatherTables && _metal_release_singular_gather_tables!(tables)
+    cache.gather_tables[] = nothing
+    return nothing
+end
+
+# ---------------------------------------------------------------------------
+# Deterministic singular write-back
+#
+# The block kernels evaluate each singular pair into a compact value buffer.
+# Getting those values into the operators can be done two ways:
+#
+#   scatter  one thread per pair, atomically adding its 3x1 and 3x3 blocks into
+#            cells that other pairs also write. Cheap to launch, but the order
+#            in which the atomics land is whatever the GPU chooses, so the same
+#            tree gives a different float32 sum on every run.
+#
+#   gather   one thread per touched cell. The thread reads the list of values
+#            that belong to it and writes their total once. No two threads share
+#            a cell, so there are no atomics and the summation order is fixed by
+#            the map. This is what makes assembly reproducible.
+#
+# The map is a CSR structure built on the host, once per mesh, and cached on the
+# singular correction cache. Building it is pure index arithmetic; it never
+# touches the kernel results.
+# ---------------------------------------------------------------------------
+
+# Collapses (entry, value) contributions into a CSR gather map: one row per
+# unique destination cell, holding the run of block-value indices that sum into
+# it. Sorting fixes the order inside each cell, which is what makes the device
+# write-back reproducible.
+function _metal_build_singular_gather_map(
+    entries::Vector{Int32},
+    values::Vector{Int32},
+    columns::Union{Nothing,Vector{Int32}},
+)
+    if isempty(entries)
+        return MetalSingularGatherMap(
+            MtlArray(Int32[]),
+            MtlArray(Int32[1]),
+            MtlArray(Int32[]),
+            columns === nothing ? nothing : MtlArray(Int32[]),
+            0,
+        )
+    end
+    # (entry, value) is unique across contributions, so sorting on the pair gives
+    # one fixed order whatever algorithm Base picks. Packing both into a single
+    # key keeps that guarantee without depending on `sortperm` being stable.
+    order = sortperm(
+        [(UInt64(reinterpret(UInt32, entries[i])) << 32) |
+         UInt64(reinterpret(UInt32, values[i])) for i in eachindex(entries)],
+    )
+    entry_indices = Int32[]
+    contrib_offsets = Int32[]
+    contrib_values = Vector{Int32}(undef, length(order))
+    contrib_columns = columns === nothing ? nothing : Vector{Int32}(undef, length(order))
+    previous = zero(Int32)
+    for (position, source) in enumerate(order)
+        entry = entries[source]
+        if isempty(entry_indices) || entry != previous
+            push!(entry_indices, entry)
+            push!(contrib_offsets, Int32(position))
+            previous = entry
+        end
+        contrib_values[position] = values[source]
+        contrib_columns === nothing || (contrib_columns[position] = columns[source])
+    end
+    push!(contrib_offsets, Int32(length(order) + 1))
+    return MetalSingularGatherMap(
+        MtlArray(entry_indices),
+        MtlArray(contrib_offsets),
+        MtlArray(contrib_values),
+        contrib_columns === nothing ? nothing : MtlArray(contrib_columns),
+        length(entry_indices),
+    )
+end
+
+# Builds all three maps in one host pass over the pair list. The pair order here
+# is the same order the block kernels use, because both walk `test_indices` and
+# `trial_indices` by position.
+function _metal_build_singular_gather_tables(
+    regular_cache::MetalRegularAssemblyCache,
+    singular_cache::MetalSingularCorrectionCache,
+    part_count::Int,
+)
+    pair_count = singular_cache.pair_count
+    face_count = regular_cache.face_count
+    p1_dof_count = regular_cache.p1_dof_count
+    dp0_dof_count = regular_cache.dp0_dof_count
+    # Destination indices are Int32 on the device. The dense operators would not
+    # fit in memory long before this overflows, but fail loudly rather than wrap.
+    largest_entry = p1_dof_count * max(p1_dof_count, dp0_dof_count)
+    largest_entry <= typemax(Int32) || error(
+        "Singular gather map needs Int32 dense indices, but p1_dof_count=$(p1_dof_count) " *
+        "and dp0_dof_count=$(dp0_dof_count) reach $(largest_entry).",
+    )
+    value_stride = pair_count * part_count
+    test_indices = Array(singular_cache.test_indices)
+    trial_indices = Array(singular_cache.trial_indices)
+    p1_dofs = Array(regular_cache.p1_dofs)
+    element_dp0_dofs = Array(regular_cache.element_dp0_dofs)
+
+    row_count = 3 * pair_count
+    block_count = 9 * pair_count
+    row_entries = Vector{Int32}(undef, row_count)
+    row_values = Vector{Int32}(undef, row_count)
+    rhs_entries = Vector{Int32}(undef, row_count)
+    rhs_columns = Vector{Int32}(undef, row_count)
+    block_entries = Vector{Int32}(undef, block_count)
+    block_values = Vector{Int32}(undef, block_count)
+
+    largest_value = pair_count + 8 * value_stride
+    largest_value <= typemax(UInt32) || error(
+        "Singular gather map packs value indices into 32 bits, but pair_count=$(pair_count) " *
+        "and part_count=$(part_count) reach $(largest_value).",
+    )
+
+    at_row = 0
+    at_block = 0
+    for pair_position in 1:pair_count
+        test_index = Int(test_indices[pair_position])
+        trial_index = Int(trial_indices[pair_position])
+        dp0_column = Int(element_dp0_dofs[trial_index])
+        # `p1_dofs` and `element_dp0_dofs` hold 0 for faces outside the assembled
+        # element set. The scatter hid such a face behind an atomic add to the
+        # wrong cell; the gather would corrupt a cell silently, so refuse here.
+        dp0_column >= 1 || error(
+            "Singular pair $(pair_position) has trial element $(trial_index) with no DP0 " *
+            "degree of freedom; the singular cache and the regular cache disagree.",
+        )
+        for local_row in 1:3
+            row = Int(p1_dofs[test_index + (local_row - 1) * face_count])
+            row >= 1 || error(
+                "Singular pair $(pair_position) has test element $(test_index) with no P1 " *
+                "degree of freedom at local row $(local_row).",
+            )
+            at_row += 1
+            # Single layer and adjoint double layer: P1 row, DP0 column.
+            row_entries[at_row] = Int32(row + (dp0_column - 1) * p1_dof_count)
+            row_values[at_row] = Int32(pair_position + (local_row - 1) * value_stride)
+            # The fused right-hand side reuses those values but lands on the row
+            # alone, weighted by the trial element's Neumann datum.
+            rhs_entries[at_row] = Int32(row)
+            rhs_columns[at_row] = Int32(dp0_column)
+        end
+        for local_column in 1:3
+            column = Int(p1_dofs[trial_index + (local_column - 1) * face_count])
+            column >= 1 || error(
+                "Singular pair $(pair_position) has trial element $(trial_index) with no P1 " *
+                "degree of freedom at local column $(local_column).",
+            )
+            for local_row in 1:3
+                row = Int(p1_dofs[test_index + (local_row - 1) * face_count])
+                component = (local_column - 1) * 3 + (local_row - 1)
+                at_block += 1
+                # Double layer, hypersingular, and the fused left-hand side:
+                # P1 row, P1 column.
+                block_entries[at_block] = Int32(row + (column - 1) * p1_dof_count)
+                block_values[at_block] = Int32(pair_position + component * value_stride)
+            end
+        end
+    end
+
+    return MetalSingularGatherTables(
+        _metal_build_singular_gather_map(row_entries, row_values, nothing),
+        _metal_build_singular_gather_map(block_entries, block_values, nothing),
+        _metal_build_singular_gather_map(rhs_entries, row_values, rhs_columns),
+        part_count,
+        objectid(regular_cache),
+    )
+end
+
+# Lazily builds and caches the maps, following the Ref{Any} idiom the regular
+# assembly cache already uses. The part split and the regular cache are part of
+# the key: both change the indices the map stores.
+function _metal_singular_gather_tables(
+    regular_cache::MetalRegularAssemblyCache,
+    singular_cache::MetalSingularCorrectionCache,
+    part_count::Int,
+)
+    tables = singular_cache.gather_tables[]
+    if tables isa MetalSingularGatherTables &&
+       tables.part_count == part_count &&
+       tables.regular_id == objectid(regular_cache)
+        return tables
+    end
+    tables isa MetalSingularGatherTables && _metal_release_singular_gather_tables!(tables)
+    tables = _metal_build_singular_gather_tables(regular_cache, singular_cache, part_count)
+    singular_cache.gather_tables[] = tables
+    return tables
+end
+
+function _metal_release_singular_gather_map!(map::MetalSingularGatherMap)
+    Metal.unsafe_free!(map.entry_indices)
+    Metal.unsafe_free!(map.contrib_offsets)
+    Metal.unsafe_free!(map.contrib_values)
+    map.contrib_columns === nothing || Metal.unsafe_free!(map.contrib_columns)
+    return nothing
+end
+
+function _metal_release_singular_gather_tables!(tables::MetalSingularGatherTables)
+    _metal_release_singular_gather_map!(tables.p1_dp0)
+    _metal_release_singular_gather_map!(tables.p1_p1)
+    _metal_release_singular_gather_map!(tables.rhs)
+    return nothing
+end
+
+# One thread per touched cell, writing two operators that share a destination
+# (single layer with adjoint double layer, double layer with hypersingular, and
+# so the map is walked once for both).
+function _metal_singular_pair_gather_kernel!(
+    first_operator,
+    second_operator,
+    first_values,
+    second_values,
+    entry_indices,
+    contrib_offsets,
+    contrib_values,
+    entry_count,
+    pair_count,
+    part_count,
+)
+    index = _metal_global_linear_index()
+    index > entry_count && return nothing
+    @inbounds begin
+        position = Int(contrib_offsets[index])
+        position_stop = Int(contrib_offsets[index + 1]) - 1
+        first_sum = zero(eltype(first_values))
+        second_sum = zero(eltype(second_values))
+        while position <= position_stop
+            value_index = Int(contrib_values[position])
+            part = 1
+            while part <= part_count
+                first_sum += first_values[value_index]
+                second_sum += second_values[value_index]
+                value_index += pair_count
+                part += 1
+            end
+            position += 1
+        end
+        entry_index = Int(entry_indices[index])
+        first_operator[entry_index] += first_sum
+        second_operator[entry_index] += second_sum
+    end
+    return nothing
+end
+
+# One thread per touched cell, writing a single operator. Used by the fused
+# Burton-Miller left-hand side, which has no second operator to share the walk.
+function _metal_singular_entry_gather_kernel!(
+    operator,
+    values,
+    entry_indices,
+    contrib_offsets,
+    contrib_values,
+    entry_count,
+    pair_count,
+    part_count,
+)
+    index = _metal_global_linear_index()
+    index > entry_count && return nothing
+    @inbounds begin
+        position = Int(contrib_offsets[index])
+        position_stop = Int(contrib_offsets[index + 1]) - 1
+        total = zero(eltype(values))
+        while position <= position_stop
+            value_index = Int(contrib_values[position])
+            part = 1
+            while part <= part_count
+                total += values[value_index]
+                value_index += pair_count
+                part += 1
+            end
+            position += 1
+        end
+        operator[Int(entry_indices[index])] += total
+    end
+    return nothing
+end
+
+# One thread per touched right-hand-side row. Each contribution carries the DP0
+# column of its trial element, because the Neumann datum differs per column and
+# per drive.
+function _metal_singular_rhs_gather_kernel!(
+    rhs,
+    rhs_values,
+    q_neumann,
+    entry_indices,
+    contrib_offsets,
+    contrib_values,
+    contrib_columns,
+    entry_count,
+    pair_count,
+    part_count,
+    p1_dof_count,
+    dp0_dof_count,
+    drive_count,
+)
+    index = _metal_global_linear_index()
+    index > entry_count && return nothing
+    @inbounds begin
+        row = Int(entry_indices[index])
+        position_start = Int(contrib_offsets[index])
+        position_stop = Int(contrib_offsets[index + 1]) - 1
+        drive = 1
+        while drive <= drive_count
+            total = zero(eltype(rhs_values))
+            position = position_start
+            while position <= position_stop
+                value_index = Int(contrib_values[position])
+                dp0_column = Int(contrib_columns[position])
+                coefficient = zero(eltype(rhs_values))
+                part = 1
+                while part <= part_count
+                    coefficient += rhs_values[value_index]
+                    value_index += pair_count
+                    part += 1
+                end
+                total += coefficient * q_neumann[dp0_column + (drive - 1) * dp0_dof_count]
+                position += 1
+            end
+            rhs[row + (drive - 1) * p1_dof_count] += total
+            drive += 1
+        end
+    end
     return nothing
 end
 
