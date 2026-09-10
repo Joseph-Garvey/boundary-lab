@@ -172,7 +172,6 @@ def test_preferences_no_longer_expose_worker_count() -> None:
     main_source = main_window_source()
     config_source = source_text("config.py")
     assembler_source = source_text("ui", "simulation_assembler.py")
-    solve_source = main_window_source("solve_workflow")
 
     assert "worker_count_spin" not in dialog_source
     assert '"Worker Count"' not in dialog_source

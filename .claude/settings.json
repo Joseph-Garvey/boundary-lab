@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(jq 'map\\(del\\(._source_page\\)\\)' examples/drivers/BC_2023_Catalogue_LF_Drivers.json)",
-      "Bash(mv examples/drivers/BC_2023_Catalogue_LF_Drivers.json.tmp examples/drivers/BC_2023_Catalogue_LF_Drivers.json)"
-    ]
-  }
-}
