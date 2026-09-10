@@ -239,6 +239,36 @@ Agreement between the two formulations is 1.3e-4 on FEM pressure, 1.8e-4 on BEM
 pressure, and 1.7e-4 on interface flux -- inside the 5e-4 Float32 gate used
 across the coupled validations.
 
+### Stage overlap
+
+Within a frequency the FEM condensation and the BEM operator assembly are
+independent: the condensation reads `fem_system`, the interface operators and
+the retained vertex list, none of which the BEM assembly touches. On Metal they
+also run on different processors -- the condensation is host UMFPACK, the
+assembly is on the GPU -- so `build_condensed_coupled_system` spawns the
+condensation on a Julia thread before it starts the BEM assembly and collects it
+afterwards. On `beat_cpu` both stages are host code competing for the same
+cores, so the overlap is off there by default.
+
+Measured through `blab project solve`, `xy` symmetry, eight Julia threads, M1
+Pro, warm mean of three frequencies, `BLAB_COUPLED_STAGE_OVERLAP=off` against
+the default:
+
+| Fixture | Condensed order | `bem_operator_s` | `assembly_s`, sequential | `assembly_s`, overlapped | Saved |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `S218BP` (40-100 Hz) | 2,151 / 19,379 | 0.19-0.22 s | 0.911 s | **0.719 s** | 0.19 s, 21% |
+| `F2B_FLH` (100-200 Hz) | 3,081 / 24,410 | 0.27-0.31 s | 1.552 s | **1.366 s** | 0.19 s, 12% |
+
+Outputs are bit-identical with the overlap on and off: the algebra is
+unchanged, only the schedule. The saving is bounded by the shorter of the two
+stages, which on these fixtures is the GPU assembly at about 0.2-0.3 s; it grows
+with the BEM mesh. `beat_cpu` on the same fixtures: 1.362 s and 2.251 s.
+
+When the stages overlap, `fem_condensation_s` is measured from before the BEM
+assembly starts, so it spans the concurrent region and must not be added to
+`bem_operator_s`; `stage_overlap` in the system timings says which reading
+applies.
+
 ### Schur block balance
 
 The Schur complement hands right-hand-side blocks to worker tasks round-robin,
@@ -272,7 +302,9 @@ condensation stage but 3.2e-3 relative norm from the UMFPACK result, over the
 was 23% faster per frequency and **1.1e-2 to 4.0e-2** relative error against
 `beat_cpu` on diaphragm velocity, voice-coil current and probe pressures, where
 UMFPACK is at 1.4e-5. The speed was the precision drop, not a better solver:
-Accelerate in `ComplexF64` matched UMFPACK on both counts.
+Accelerate in `ComplexF64` matched UMFPACK on both counts. Overlapping the
+condensation with the GPU assembly recovers most of what it offered without
+touching the numerics.
 
 ## Requirements
 
@@ -316,6 +348,7 @@ Normal application use does not require these environment variables.
 | `BLAB_METAL_OPERATOR_STORAGE` | `shared` | Use `private` to allocate the operator matrices in private storage and copy them to the host, the pre-2026-09-02 behavior. |
 | `BLAB_METAL_PIPELINE` | `1` | Set to `0` to assemble and solve each sweep frequency sequentially instead of overlapping GPU assembly with the CPU factorization. |
 | `BLAB_METAL_ATOMIC_SCATTER` | `1` | Diagnostic for `pair_atomic` only: `0` skips the atomic scatter to time the pair arithmetic (the operators are then wrong). |
+| `BLAB_COUPLED_STAGE_OVERLAP` | `auto` | Coupled solves: `auto` runs the FEM condensation on its own thread while the GPU assembles the BEM operators; `off` runs them in sequence; `on` forces the overlap on `beat_cpu` too. Needs more than one Julia thread. |
 | `BLAB_SCHUR_BLOCK` | unset | Coupled solves: pins the Schur complement right-hand-side block width, bypassing the thread-count balancing. For measurement only. |
 | `BLAB_BEAT_FUSED_BM` | `1` | Set to `0` to assemble the four operators and combine them on the host for exterior solves. Coupled solves, `host_staged` assembly and the `host` singular mode always take the four-operator path. |
 

@@ -1196,6 +1196,11 @@ if get(ENV, "BLAB_RUN_COUPLED_METAL", "0") == "1" && metal_available()
             transducer_operators=condensed_transducer_operators,
         )
         condensed_system = build_metal_condensed()
+        # Same build with the FEM condensation forced back in sequence with
+        # the GPU assembly: the overlap must change the timing, not the algebra.
+        sequential_system = withenv("BLAB_COUPLED_STAGE_OVERLAP" => "off") do
+            build_metal_condensed()
+        end
         try
             cpu_solution = solve_coupled_system(cpu_system, radiator_tag)
             metal_solutions = solve_coupled_systems(
@@ -1249,6 +1254,9 @@ if get(ENV, "BLAB_RUN_COUPLED_METAL", "0") == "1" && metal_available()
             @test condensed_system.bem_backend == :metal
             @test condensed_system.formulation == :fem_interface_condensed
             @test condensed_system.condensation.backend == :cpu_umfpack
+            @test condensed_system.timings.stage_overlap == (Threads.nthreads() > 1)
+            @test sequential_system.timings.stage_overlap == false
+            @test sequential_system.condensation.schur == condensed_system.condensation.schur
             @test condensed_system.solved_system_order < condensed_system.full_system_order
             @test condensed_system.condensation.schur_block_size > 0
             @test 1 <= condensed_system.condensation.schur_thread_count <= Threads.nthreads()
@@ -1385,6 +1393,7 @@ if get(ENV, "BLAB_RUN_COUPLED_METAL", "0") == "1" && metal_available()
             release_coupled_system!(cpu_system)
             release_coupled_system!(metal_system)
             release_condensed_coupled_system!(condensed_system)
+            release_condensed_coupled_system!(sequential_system)
             release_condensed_coupled_cache!(metal_condensed_cache)
         end
     end

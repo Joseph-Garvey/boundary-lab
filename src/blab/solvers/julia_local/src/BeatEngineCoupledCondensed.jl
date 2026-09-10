@@ -523,6 +523,37 @@ function release_condensed_coupled_cache!(cache)
 end
 
 """
+    _stage_overlap_enabled(bem_backend) -> Bool
+
+Whether to run the FEM static condensation concurrently with the BEM operator
+assembly inside `build_condensed_coupled_system`.
+
+The two stages are independent: the condensation reads `fem_system`, the
+interface operators and the retained vertex list, none of which the BEM assembly
+touches. Run in sequence, one processor idles for the other's duration — but
+that only costs anything when the two stages use *different* processors. On
+Metal the BEM assembly is on the GPU while the condensation is host UMFPACK, so
+overlapping hides the shorter stage. On `:cpu` both are host code competing for
+the same cores (the Schur complement already saturates them through
+`_blocked_umfpack_schur_complement`), so overlapping buys nothing there.
+Hence: Metal on, CPU off.
+
+`BLAB_COUPLED_STAGE_OVERLAP` overrides the default: `auto`, `on`, or `off`. A
+spawned condensation needs a thread of its own, so a single-threaded Julia
+always runs the stages in sequence.
+"""
+function _stage_overlap_enabled(bem_backend::Symbol)
+    requested = lowercase(strip(get(ENV, "BLAB_COUPLED_STAGE_OVERLAP", "auto")))
+    requested in ("auto", "on", "off") || error(
+        "Unsupported BLAB_COUPLED_STAGE_OVERLAP value: $requested. Expected auto, on, or off.",
+    )
+    requested == "off" && return false
+    Threads.nthreads() > 1 || return false
+    requested == "on" && return true
+    return bem_backend == :metal
+end
+
+"""
     build_condensed_coupled_system(fem_mesh, bem_mesh, interface_map, frequency_hz, sound_speed, density; ...)
 
 Assemble and factor the interface-condensed coupled system on the CPU.
@@ -653,6 +684,20 @@ function build_condensed_coupled_system(
     prescribed_bem_count = size(bem_prescribed_neumann, 2)
     fem_system_s = (time_ns() - fem_stage_started) / 1.0e9
 
+    # Everything the condensation reads is final here and nothing below writes
+    # to it, so on Metal it runs on the host while the BEM operators assemble
+    # on the GPU. Started before the BEM stage rather than at its own marker
+    # below because the overlap is the whole point; `fem_condensation_s` then
+    # spans the concurrent region, and `stage_overlap` in the timings says so.
+    stage_overlap = _stage_overlap_enabled(prepared.bem_backend)
+    condensation_started = time_ns()
+    condensation_task = stage_overlap ? Threads.@spawn(_build_condensation(
+        fem_system,
+        interface_operators,
+        retained_fem_vertices;
+        schur_block_columns=schur_block_columns,
+    )) : nothing
+
     bem_operator_started = time_ns()
     # This solver's own fork of the CPU regular assembly, so it can be optimised without
     # touching the shared path every other backend runs through. Behaviourally identical to
@@ -706,13 +751,25 @@ function build_condensed_coupled_system(
                          Complex{T}.(bem_rhs_operator * bem_prescribed_neumann)
     bem_matrix_s = (time_ns() - bem_matrix_started) / 1.0e9
 
-    condensation_started = time_ns()
-    condensation = _build_condensation(
-        fem_system,
-        interface_operators,
-        retained_fem_vertices;
-        schur_block_columns=schur_block_columns,
-    )
+    stage_overlap || (condensation_started = time_ns())
+    condensation = if isnothing(condensation_task)
+        _build_condensation(
+            fem_system,
+            interface_operators,
+            retained_fem_vertices;
+            schur_block_columns=schur_block_columns,
+        )
+    else
+        # `fetch` wraps a task failure in a TaskFailedException, which would
+        # make the error a caller sees depend on whether the stage happened to
+        # be overlapped. Rethrow the original instead.
+        try
+            fetch(condensation_task)
+        catch exception
+            exception isa TaskFailedException || rethrow()
+            rethrow(exception.task.result)
+        end
+    end
     fem_condensation_s = (time_ns() - condensation_started) / 1.0e9
 
     block_assembly_started = time_ns()
@@ -827,6 +884,9 @@ function build_condensed_coupled_system(
             bem_operator_s=bem_operator_s,
             bem_matrix_s=bem_matrix_s,
             fem_condensation_s=fem_condensation_s,
+            # True when `fem_condensation_s` and `bem_operator_s` cover the same
+            # wall-clock span and must not be added together.
+            stage_overlap=stage_overlap,
             block_assembly_s=block_assembly_s,
             coupled_factorization_s=coupled_factorization_s,
             replay_factorization_s=0.0,

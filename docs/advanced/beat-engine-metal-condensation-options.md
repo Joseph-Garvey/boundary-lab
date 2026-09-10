@@ -272,6 +272,14 @@ balancing in [Schur block balance](beat-engine-metal.md#schur-block-balance),
 `F2B_FLH` went from 2.68 s to 1.70 s per frequency, and Metal from a tie with
 BEAT CPU to 1.62x ahead of it, with bit-identical outputs.
 
+*Addendum, 2026-09-10.* Those figures were taken on the host condensation that
+has since been removed (see the status note above). The overlap now lives in
+the condensed solver that the production route actually runs, and re-measured
+there through `blab project solve` at eight threads it saves 0.19 s per warm
+frequency on both `S218BP` (0.911 s to 0.719 s) and `F2B_FLH` (1.552 s to
+1.366 s), again bit-identical; `beat_cpu` sits at 1.362 s and 2.251 s on the
+same runs.
+
 That reframes what follows. The table below is the pre-overlap budget, kept
 because the measurements are still sound and still say where the host time goes.
 But `fem_condensation_s` is now partly hidden behind device assembly, so the

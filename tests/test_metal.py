@@ -137,6 +137,9 @@ def test_metal_condenses_through_the_cpu_condensed_solver() -> None:
         encoding="utf-8"
     )
     assert "bem_backend in (:cpu, :metal)" in condensed
+    # The FEM condensation overlaps the GPU operator assembly on Metal.
+    assert "BLAB_COUPLED_STAGE_OVERLAP" in condensed
+    assert "return bem_backend == :metal" in condensed
 
     coupled = (REPO_ROOT / "src/blab/solvers/julia_local/src/BeatEngineCoupled.jl").read_text(encoding="utf-8")
     assert "static_condensation && !(bem_backend in (:cuda, :rocm))" in coupled
@@ -223,15 +226,18 @@ def test_accelerate_condensation_is_gone_and_archived() -> None:
     assert "removed" in options
 
 
-def test_metal_doc_records_the_condensation_route() -> None:
+def test_metal_doc_records_the_condensation_route_and_the_overlap() -> None:
     doc = (REPO_ROOT / "docs/advanced/beat-engine-metal.md").read_text(encoding="utf-8")
     section = doc[doc.index("## FEM static condensation") : doc.index("## Requirements")]
     assert "BeatEngineCoupledCondensed.jl" in section
+    assert "### Stage overlap" in section
     assert "### Schur block balance" in section
+    assert "BLAB_COUPLED_STAGE_OVERLAP" in section
     # The accuracy cost that retired Accelerate stays on record.
     assert "archive/metal-host-condensation" in section
     assert "3.2e-3" in section
     assert "5e-4" in section
     controls = doc[doc.index("## Runtime controls") :]
+    assert "BLAB_COUPLED_STAGE_OVERLAP" in controls
     assert "BLAB_METAL_FEM_CONDENSATION" not in controls
     assert "BLAB_ACCELERATE_SCHUR_BLOCK" not in controls
