@@ -8,20 +8,40 @@
 # physics tolerance, and this check is stronger than the exterior/symmetry
 # validation scripts because it isolates the fusion from every other stage.
 #
-#   BLAB_VALIDATE_MESH_PATH   absolute mesh path (default: the bundled sample)
-#   BLAB_VALIDATE_SCALE       mesh scale (default 0.001 for the sample)
+#   BLAB_VALIDATE_MESH_PATH   absolute mesh path, used for every arm; overrides
+#                             the per-arm default below
+#   BLAB_VALIDATE_MESH        bundled mesh name, used for every arm; overrides
+#                             the per-arm default below
+#   BLAB_VALIDATE_SCALE       mesh scale (default 0.001 for the bundled meshes)
 #   BLAB_VALIDATE_SYMMETRY    comma-separated arms of off | x | xy | ground
-#                             (default `off,x,ground`; every arm is run and the
-#                             script fails if any of them fails)
+#                             (default `off,x,xy,ground`; every arm is run and
+#                             the script fails if any of them fails)
 #   BLAB_VALIDATE_DRIVES      number of independent drive columns (default 2)
 #
-# `xy` is deliberately not in the default arm list. On the bundled sample that
-# combination fails `pressure_relative_error` on unmodified code, and two runs
-# of the same tree disagree by ~2x: the operators agree to 1e-7 and the LU of
-# the symmetry-reduced matrix amplifies the atomic-accumulation
-# non-determinism of the singular scatter into 1e-5. It is a property of that
-# fixture at that symmetry, not of the assembly path, and it is reproducible on
-# a tree with no local changes. Run `BLAB_VALIDATE_SYMMETRY=xy` to reproduce it.
+# Each arm gets the mesh that is a fundamental domain for it. A symmetry-reduced
+# assembly folds mirror images onto a mesh that is supposed to be one sector, so
+# handing it a mesh that already spans both sides of the plane double-counts and
+# leaves the operator near-singular. `sample.msh` spans x in [-0.198, 0.199] and
+# y in [-0.126, 0.127], so it is a fundamental domain for `off` and `ground`
+# only; `sample_half.msh` adds `x`, and `sample_quarter.msh` adds `xy`.
+#
+# This is what used to keep `xy` out of the default arm list. Run on
+# `sample.msh` it failed `pressure_relative_error` at ~1.6e-5 against the 5e-6
+# tolerance. On this M1 Pro the condition number of the Burton-Miller left-hand
+# side at 2 kHz shows why:
+#
+#   arm  mesh                 kappa (cpu)  kappa (metal)  ||cpu-metal||/||cpu||
+#   off  sample.msh              4.44e+02       4.44e+02  4.2e-06
+#   x    sample.msh              1.81e+07       2.43e+04  1.00e+00
+#   xy   sample.msh              1.33e+09       5.52e+04  1.00e+00
+#   x    sample_half.msh         5.29e+02       5.29e+02  4.2e-06
+#   xy   sample_quarter.msh      5.23e+02       5.23e+02  4.1e-06
+#
+# On the right mesh every arm is well conditioned and the two backends agree.
+# The fold is correct; the fixture was not. `xy` now passes at 5.4e-7.
+#
+# The fundamental-domain check below is what should have caught this: it is the
+# same one the drivers and every other symmetry script already run.
 using LinearAlgebra, Random
 
 include(joinpath(@__DIR__, "..", "src", "BeatEngineCore.jl"))
@@ -32,6 +52,14 @@ function relative_error(actual, reference)
     return norm(actual - reference) / denominator
 end
 
+# The mesh that is a fundamental domain for each arm. `ground` folds through an
+# image source rather than through the mesh, so it has no sector constraint.
+function _default_mesh_for(symmetry_mode::Symbol)
+    symmetry_mode === :x && return "sample_half.msh"
+    symmetry_mode === :xy && return "sample_quarter.msh"
+    return "sample.msh"
+end
+
 function validate_metal_fused_burton_miller(symmetry_mode::Symbol)
     metal = BeatEngineCore.METAL_MODULE
     metal === nothing && error("Metal.jl did not load. Run this script with the julia_metal project.")
@@ -40,7 +68,10 @@ function validate_metal_fused_burton_miller(symmetry_mode::Symbol)
     mesh_path = get(ENV, "BLAB_VALIDATE_MESH_PATH", "")
     scale = Float32(parse(Float64, get(ENV, "BLAB_VALIDATE_SCALE", isempty(mesh_path) ? "0.001" : "1.0")))
     if isempty(mesh_path)
-        mesh_path = joinpath(@__DIR__, "..", "test_meshes", get(ENV, "BLAB_VALIDATE_MESH", "sample.msh"))
+        mesh_path = joinpath(
+            @__DIR__, "..", "test_meshes",
+            get(ENV, "BLAB_VALIDATE_MESH", _default_mesh_for(symmetry_mode)),
+        )
     end
     drive_count = parse(Int, get(ENV, "BLAB_VALIDATE_DRIVES", "2"))
     regular_order = parse(Int, get(ENV, "BLAB_VALIDATE_REGULAR_ORDER", "4"))
@@ -50,6 +81,9 @@ function validate_metal_fused_burton_miller(symmetry_mode::Symbol)
 
     mesh = load_gmsh22_with_tags(mesh_path, scale)
     mesh = snap_symmetry_planes(mesh, symmetry_mode)
+    # A symmetry-reduced assembly only means anything on a mesh that is one
+    # sector. Fail here rather than return a plausible-looking pressure error.
+    validate_symmetry_fundamental_domain!(mesh, symmetry_mode)
     p1 = build_p1_space(mesh)
     dp0 = build_dp0_space(mesh)
     rule = triangle_rule(Float32, regular_order)
@@ -146,7 +180,7 @@ function validate_metal_fused_burton_miller(symmetry_mode::Symbol)
 end
 
 function validate_metal_fused_burton_miller()
-    arms = [Symbol(strip(arm)) for arm in split(get(ENV, "BLAB_VALIDATE_SYMMETRY", "off,x,ground"), ",")
+    arms = [Symbol(strip(arm)) for arm in split(get(ENV, "BLAB_VALIDATE_SYMMETRY", "off,x,xy,ground"), ",")
             if !isempty(strip(arm))]
     isempty(arms) && error("BLAB_VALIDATE_SYMMETRY named no symmetry arm.")
     failed = Symbol[]

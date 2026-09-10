@@ -307,35 +307,75 @@ CPU-versus-Metal differences exceed their tolerances.
   relative in the exterior field. Golden-file comparisons belong on the CPU
   `reference` path, tolerance comparisons everywhere else.
 
-## Known issue: the fused Burton-Miller gate at symmetry `xy`
+## Resolved: the fused Burton-Miller gate at symmetry `xy`
 
-`validate_metal_fused_burton_miller.jl` run with `BLAB_VALIDATE_SYMMETRY=xy` on
-the bundled `sample.msh` fails `pressure_relative_error` at about 2e-5 against
-the script's 5e-6 tolerance, while its `lhs` and `rhs` errors sit at 1.4e-7 and
-9.7e-7. So it is not an operator defect: the operators agree, and the LU of the
-symmetry-reduced matrix at that fixture amplifies the remaining difference by
-about twenty times into the pressure. `off`, `x` and `ground` amplify by three
-to five times on the same fixture and pass.
+`validate_metal_fused_burton_miller.jl` used to fail its `xy` arm, and `xy` was
+kept out of the default arm list because of it. It passes now, on all four arms,
+and the cause was the test fixture rather than any assembly code.
 
-This used to fail **non-deterministically** as well, and the earlier note here
-blamed the atomic singular scatter and proposed a deterministic scatter as one
-of the two possible fixes. The first half of that was right; the second was not.
-Measured on an M1 Pro, `sample.msh`, three runs each:
+**A symmetry-reduced assembly needs a mesh that is one sector.** It folds mirror
+images onto that sector. Hand it a mesh that already spans both sides of the
+mirror plane and every contribution is counted twice, leaving an operator that is
+close to singular. `sample.msh` spans x in [-0.198, 0.199] and y in
+[-0.126, 0.127], so it is a valid fundamental domain for `off` and `ground` only.
+The tell was that `snap_symmetry_planes` did nothing to it: identical faces,
+vertices and triangle aspect ratios on all four arms, because there was nothing
+to snap.
+
+Condition number of the Burton-Miller left-hand side, 2 kHz, Apple M1 Pro:
+
+| arm | mesh | kappa (cpu) | kappa (metal) | backends agree? |
+|---|---|---|---|---|
+| `off` | `sample.msh` | 4.44e+02 | 4.44e+02 | yes, to 4.2e-6 |
+| `x` | `sample.msh` | 1.81e+07 | 2.43e+04 | **no, 100% apart** |
+| `xy` | `sample.msh` | 1.33e+09 | 5.52e+04 | **no, 100% apart** |
+| `x` | `sample_half.msh` | 5.29e+02 | 5.29e+02 | yes, to 4.2e-6 |
+| `xy` | `sample_quarter.msh` | 5.23e+02 | 5.23e+02 | yes, to 4.1e-6 |
+
+On the correct mesh every arm is well conditioned and the two backends agree.
+The fold itself is sound. On the wrong mesh both backends produce garbage, and
+different garbage, which is why the CPU and Metal columns diverge completely.
+
+The script now picks the fundamental domain per arm — `sample.msh` for `off` and
+`ground`, `sample_half.msh` for `x`, `sample_quarter.msh` for `xy` — and calls
+`validate_symmetry_fundamental_domain!` after snapping, the same check the
+drivers and every other symmetry script already ran. An invalid combination now
+stops with a named vertex instead of returning a plausible-looking error:
+
+```
+ERROR: Mesh is not in the positive X fundamental domain for XY symmetry.
+       Vertex 41 has x=-0.0098830005 m.
+```
+
+Results after the fix, M1 Pro, tolerance 5e-6:
+
+| arm | mesh | lhs | rhs | pressure |
+|---|---|---|---|---|
+| `off` | `sample.msh` | 2.5e-7 | 5.4e-7 | 6.393e-7 |
+| `x` | `sample_half.msh` | 2.532e-7 | 3.439e-7 | 6.170e-7 |
+| `xy` | `sample_quarter.msh` | 2.559e-7 | 3.275e-7 | **5.397e-7** |
+| `ground` | `sample.msh` | 1.6e-7 | 1.0e-6 | 2.839e-6 |
+
+Against 1.6459548e-5 for `xy` on `sample.msh`. All four arms are in the default
+list now.
+
+### What this cost, and the note that misdirected it
+
+An earlier version of this section blamed the atomic singular scatter and offered
+two candidate fixes: a better-conditioned `xy` fixture, **or** a deterministic
+scatter. The first was right. The second was not, and it was the one that got
+built first.
+
+The deterministic write-back was worth having on its own merits and is now the
+default (see the singular write-back section above). It removed the run-to-run
+spread completely. It did not move the arm:
 
 | write-back | run 1 | run 2 | run 3 |
 |---|---|---|---|
 | `scatter` (atomics) | 2.3376e-5 | 1.7533e-5 | 2.1780e-5 |
-| `gather` (default) | 1.6459548e-5 | 1.6459548e-5 | 1.6459548e-5 |
+| `gather` (deterministic) | 1.6459548e-5 | 1.6459548e-5 | 1.6459548e-5 |
 
-The deterministic write-back exists now and it removed the run-to-run spread
-completely, but the arm still fails. The atomics were adding roughly plus or
-minus thirty percent of noise on top of a real error near 1.6e-5, which is
-already three times the tolerance. Changing the summation order to another valid
-fixed order moves the number inside the same 1.4e-5 to 2.6e-5 band, which is
-what float32 sensitivity amplified by this fixture's conditioning looks like.
-
-So `xy` remains out of the script's default arm list, and closing it needs a
-better-conditioned `xy` fixture, or a tolerance argued from the conditioning
-rather than picked. It is not a write-back problem and no further work on the
-kernels will close it. The arm is still one `BLAB_VALIDATE_SYMMETRY=xy` away for
-anyone working on it.
+The atomics were adding about plus or minus thirty percent of noise on top of a
+real error near 1.6e-5, which was already three times the tolerance. The noise
+was the visible symptom; the invalid fixture was the cause. A diagnosis that
+explains only the variance and not the magnitude is not finished.
