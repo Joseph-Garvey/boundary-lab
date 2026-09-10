@@ -1,7 +1,8 @@
-import type { Fidelity, LoadedSpeakerPackage, MicrophoneConfiguration, ObservationPlane, RigidMeshAsset, RigidMeshConfiguration, SourceConfiguration } from "../model/types";
+import { createDefaultChannel, DEFAULT_CHANNEL_ID } from "../model/channels";
+import type { DeployChannel, EqualizerConfiguration, Fidelity, LoadedSpeakerPackage, MicrophoneConfiguration, ObservationPlane, RigidMeshAsset, RigidMeshConfiguration, SourceConfiguration } from "../model/types";
 
 export const DEPLOY_PROJECT_SCHEMA = "boundary-lab-deploy-project";
-export const DEPLOY_PROJECT_SCHEMA_VERSION = 5;
+export const DEPLOY_PROJECT_SCHEMA_VERSION = 7;
 
 export interface DeployPackageReference {
   id: string;
@@ -22,6 +23,7 @@ export interface DeployProject {
   name: string;
   packages: DeployPackageReference[];
   rigid_meshes: DeployRigidMeshReference[];
+  channels: DeployChannel[];
   sources: SourceConfiguration[];
   rigid_objects: RigidMeshConfiguration[];
   microphones: MicrophoneConfiguration[];
@@ -75,7 +77,39 @@ function gridSize(value: unknown, label: string): number {
   return result;
 }
 
-function sourceConfiguration(value: unknown, index: number): SourceConfiguration {
+function equalizerConfiguration(value: unknown, label: string, legacy: boolean): EqualizerConfiguration {
+  if (legacy || value === undefined) return { filters: [] };
+  const equalizer = record(value, label);
+  if (!Array.isArray(equalizer.filters)) throw new Error(`${label}.filters must be an array.`);
+  // The editor is intentionally a placeholder. Reject non-empty banks until the
+  // filter evaluator and its schema are implemented together.
+  if (equalizer.filters.length > 0) throw new Error(`${label}.filters are not supported by this version.`);
+  return { filters: [] };
+}
+
+function channelConfiguration(value: unknown, index: number): DeployChannel {
+  const channel = record(value, `channels[${index}]`);
+  for (const field of ["id", "name", "color"] as const) {
+    if (typeof channel[field] !== "string" || channel[field].trim().length === 0) {
+      throw new Error(`channels[${index}].${field} must be a non-empty string.`);
+    }
+  }
+  const polarity = finite(channel.polarity, `channels[${index}].polarity`);
+  if (polarity !== 1 && polarity !== -1) throw new Error(`channels[${index}].polarity must be 1 or -1.`);
+  if (typeof channel.muted !== "boolean") throw new Error(`channels[${index}].muted must be a boolean.`);
+  return {
+    id: String(channel.id),
+    name: String(channel.name).trim(),
+    color: String(channel.color),
+    levelDb: finite(channel.levelDb, `channels[${index}].levelDb`),
+    delayMs: finite(channel.delayMs, `channels[${index}].delayMs`),
+    polarity: polarity as 1 | -1,
+    muted: channel.muted,
+    equalizer: equalizerConfiguration(channel.equalizer, `channels[${index}].equalizer`, false),
+  };
+}
+
+function sourceConfiguration(value: unknown, index: number, legacy: boolean): SourceConfiguration {
   const source = record(value, `sources[${index}]`);
   if (typeof source.id !== "string" || source.id.trim().length === 0) {
     throw new Error(`sources[${index}].id must be a non-empty string.`);
@@ -98,9 +132,11 @@ function sourceConfiguration(value: unknown, index: number): SourceConfiguration
     pitchDeg: finite(source.pitchDeg, `sources[${index}].pitchDeg`),
     yawDeg: finite(source.yawDeg, `sources[${index}].yawDeg`),
     rollDeg: finite(source.rollDeg, `sources[${index}].rollDeg`),
+    channelId: legacy ? DEFAULT_CHANNEL_ID : String(source.channelId ?? ""),
     levelDb: finite(source.levelDb, `sources[${index}].levelDb`),
     delayMs: finite(source.delayMs, `sources[${index}].delayMs`),
     polarity: polarity as 1 | -1,
+    equalizer: equalizerConfiguration(source.equalizer, `sources[${index}].equalizer`, legacy),
   };
 }
 
@@ -124,13 +160,25 @@ function rigidConfiguration(value: unknown, index: number): RigidMeshConfigurati
   };
 }
 
-function observationPlane(value: unknown): ObservationPlane {
+function observationPlane(value: unknown, legacyVersion = false): ObservationPlane {
   const plane = record(value, "observation_plane");
   const minimumDb = finite(plane.heatmapMinimumDb, "observation_plane.heatmapMinimumDb");
   const maximumDb = finite(plane.heatmapMaximumDb, "observation_plane.heatmapMaximumDb");
   if (maximumDb <= minimumDb) throw new Error("The heatmap maximum must be greater than its minimum.");
   const bandingDb = finite(plane.heatmapBandingDb, "observation_plane.heatmapBandingDb");
   if (bandingDb < 0) throw new Error("observation_plane.heatmapBandingDb cannot be negative.");
+  const displayMode = legacyVersion && plane.displayMode === undefined ? "spl" : plane.displayMode;
+  if (displayMode !== "spl" && displayMode !== "real_pressure" && displayMode !== "imaginary_pressure") {
+    throw new Error("observation_plane.displayMode must be spl, real_pressure, or imaginary_pressure.");
+  }
+  const pressureScalePa = legacyVersion && plane.pressureScalePa === undefined ? 10 : finite(plane.pressureScalePa, "observation_plane.pressureScalePa");
+  if (pressureScalePa < 1 || pressureScalePa > 100) {
+    throw new Error("observation_plane.pressureScalePa must be between 1 and 100.");
+  }
+  const phaseAnimationSpeedHz = legacyVersion && plane.phaseAnimationSpeedHz === undefined ? 1 : finite(plane.phaseAnimationSpeedHz, "observation_plane.phaseAnimationSpeedHz");
+  if (phaseAnimationSpeedHz < 0.1 || phaseAnimationSpeedHz > 4) {
+    throw new Error("observation_plane.phaseAnimationSpeedHz must be between 0.1 and 4 Hz.");
+  }
   return {
     widthM: positive(plane.widthM, "observation_plane.widthM"),
     depthM: positive(plane.depthM, "observation_plane.depthM"),
@@ -145,6 +193,9 @@ function observationPlane(value: unknown): ObservationPlane {
     heatmapMinimumDb: minimumDb,
     heatmapMaximumDb: maximumDb,
     heatmapBandingDb: bandingDb,
+    displayMode,
+    pressureScalePa,
+    phaseAnimationSpeedHz,
   };
 }
 
@@ -158,7 +209,7 @@ export function parseDeployProject(contents: string): DeployProject {
   const project = record(raw, "Project");
   if (project.schema !== DEPLOY_PROJECT_SCHEMA) throw new Error("This is not a Boundary Lab Deploy project.");
   const version = finite(project.schema_version, "schema_version");
-  if (version !== DEPLOY_PROJECT_SCHEMA_VERSION) {
+  if (version !== 5 && version !== 6 && version !== DEPLOY_PROJECT_SCHEMA_VERSION) {
     throw new Error(`Unsupported Boundary Lab Deploy project schema version ${version}.`);
   }
   if (typeof project.name !== "string" || project.name.trim().length === 0) {
@@ -202,8 +253,13 @@ export function parseDeployProject(contents: string): DeployProject {
   });
   if (new Set(rigidMeshes.map((item) => item.id)).size !== rigidMeshes.length) throw new Error("Every rigid mesh asset must have a unique id.");
   const sourcesValue = project.sources;
-  if (!Array.isArray(sourcesValue) || sourcesValue.length === 0) throw new Error("A project must contain at least one source.");
-  const sources = sourcesValue.map(sourceConfiguration);
+  if (!Array.isArray(sourcesValue)) throw new Error("sources must be an array.");
+  const legacyChannels = version < 7;
+  if (!legacyChannels && !Array.isArray(project.channels)) throw new Error("channels must be an array.");
+  const channels = legacyChannels ? [createDefaultChannel()] : (project.channels as unknown[]).map(channelConfiguration);
+  if (channels.length === 0) throw new Error("A project must contain at least one channel.");
+  if (new Set(channels.map((channel) => channel.id)).size !== channels.length) throw new Error("Every project channel must have a unique id.");
+  const sources = sourcesValue.map((value, index) => sourceConfiguration(value, index, legacyChannels));
   if (new Set(sources.map((source) => source.id)).size !== sources.length) {
     throw new Error("Every project source must have a unique id.");
   }
@@ -211,6 +267,8 @@ export function parseDeployProject(contents: string): DeployProject {
   if (sources.some((source) => !packageIds.has(source.packageId))) {
     throw new Error("Every project source must reference an imported package.");
   }
+  const channelIds = new Set(channels.map((channel) => channel.id));
+  if (sources.some((source) => !channelIds.has(source.channelId))) throw new Error("Every project source must reference a channel.");
   if (!Array.isArray(project.rigid_objects)) throw new Error("rigid_objects must be an array.");
   const rigidObjects = project.rigid_objects.map(rigidConfiguration);
   const rigidAssetIds = new Set(rigidMeshes.map((item) => item.id));
@@ -241,10 +299,11 @@ export function parseDeployProject(contents: string): DeployProject {
     name: project.name.trim(),
     packages,
     rigid_meshes: rigidMeshes,
+    channels,
     sources,
     rigid_objects: rigidObjects,
     microphones,
-    observation_plane: observationPlane(project.observation_plane),
+    observation_plane: observationPlane(project.observation_plane, version === 5),
     selected_frequency_hz: frequencyHz,
     requested_fidelity: requestedFidelity,
   };
@@ -254,6 +313,7 @@ export function createDeployProject(
   name: string,
   packages: LoadedSpeakerPackage[],
   rigidMeshes: RigidMeshAsset[],
+  channels: DeployChannel[],
   sources: SourceConfiguration[],
   rigidObjects: RigidMeshConfiguration[],
   microphones: MicrophoneConfiguration[],
@@ -272,6 +332,7 @@ export function createDeployProject(
       source_file: asset.sourcePath,
       scale_to_meters: asset.scaleToMeters,
     })),
+    channels,
     sources,
     rigid_objects: rigidObjects,
     microphones,

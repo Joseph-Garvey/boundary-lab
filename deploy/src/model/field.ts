@@ -13,6 +13,44 @@ import type {
 
 const PRESSURE_REFERENCE_PA = 20e-6;
 
+export function logicalExcitationIndices(
+  pkg: LoadedSpeakerPackage,
+  selectedIndex = 0,
+): number[] {
+  const excitationCount = pkg.pressureShape[1];
+  if (selectedIndex < 0 || selectedIndex >= excitationCount) {
+    throw new Error("Selected speaker-package excitation index is out of range.");
+  }
+  const portIds = pkg.manifest.excitation_port_ids;
+  const sourceIds = pkg.manifest.physical_system?.metadata
+    ?.speaker_export_symmetry_expansion?.excitation_port_source_ids;
+  if (portIds.length !== excitationCount || !sourceIds) return [selectedIndex];
+  const logicalSourceId = sourceIds[portIds[selectedIndex]];
+  if (!logicalSourceId) return [selectedIndex];
+  const grouped = portIds.flatMap((portId, index) => (
+    sourceIds[portId] === logicalSourceId ? [index] : []
+  ));
+  return grouped.length > 0 ? grouped : [selectedIndex];
+}
+
+function patternPressureSample(
+  pkg: LoadedSpeakerPackage,
+  frequencyIndex: number,
+  directionIndex: number,
+  excitationIndices: number[],
+): [number, number] {
+  const excitationCount = pkg.pressureShape[1];
+  const directionCount = pkg.pressureShape[2];
+  let real = 0;
+  let imag = 0;
+  excitationIndices.forEach((excitationIndex) => {
+    const offset = (frequencyIndex * excitationCount + excitationIndex) * directionCount + directionIndex;
+    real += pkg.pressure.real[offset];
+    imag += pkg.pressure.imag[offset];
+  });
+  return [real, imag];
+}
+
 function selectKth(values: Float32Array, target: number): number {
   let left = 0;
   let right = values.length - 1;
@@ -77,8 +115,7 @@ export function computeMicrophonePatternResponses(
     }
     return { distance, directionIndex, referenceRadius: pkg.radiiM[directionIndex] };
   }));
-  const excitationCount = pkg.pressureShape[1];
-  const directionCount = pkg.pressureShape[2];
+  const excitationIndices = logicalExcitationIndices(pkg);
   return {
     frequenciesHz,
     traces: microphones.map((microphone, microphoneIndex) => {
@@ -92,16 +129,19 @@ export function computeMicrophonePatternResponses(
         sources.forEach((_source, sourceIndex) => {
           const sample = sourceDirectionData[microphoneIndex][sourceIndex];
           const config = configs[sourceIndex];
-          const pressureIndex = (frequencyIndex * excitationCount) * directionCount + sample.directionIndex;
-          const sampleReal = pkg.pressure.real[pressureIndex];
-          const sampleImag = pkg.pressure.imag[pressureIndex];
+          const [sampleReal, sampleImag] = patternPressureSample(
+            pkg,
+            frequencyIndex,
+            sample.directionIndex,
+            excitationIndices,
+          );
           const scale = sample.referenceRadius / sample.distance;
           const propagationPhase = wavenumber * (sample.distance - sample.referenceRadius);
           const propagationReal = Math.cos(propagationPhase) * scale;
           const propagationImag = Math.sin(propagationPhase) * scale;
           const fieldReal = sampleReal * propagationReal - sampleImag * propagationImag;
           const fieldImag = sampleReal * propagationImag + sampleImag * propagationReal;
-          const driveMagnitude = Math.pow(10, config.levelDb / 20) * config.polarity;
+          const driveMagnitude = (config.muted ? 0 : Math.pow(10, config.levelDb / 20)) * config.polarity;
           const drivePhase = 2 * Math.PI * frequency * config.delayMs / 1000;
           const driveReal = driveMagnitude * Math.cos(drivePhase);
           const driveImag = driveMagnitude * Math.sin(drivePhase);
@@ -169,14 +209,21 @@ export function computeMixedMicrophonePatternResponses(
         let totalImag = 0;
         sourceData[microphoneIndex].forEach((sample) => {
           const [lower, upper, mix] = frequencyBracket(sample.pkg, frequency);
-          const excitationCount = sample.pkg.pressureShape[1];
-          const directionCount = sample.pkg.pressureShape[2];
-          const lowerOffset = (lower * excitationCount) * directionCount + sample.directionIndex;
-          const upperOffset = (upper * excitationCount) * directionCount + sample.directionIndex;
-          const sampleReal = sample.pkg.pressure.real[lowerOffset]
-            + (sample.pkg.pressure.real[upperOffset] - sample.pkg.pressure.real[lowerOffset]) * mix;
-          const sampleImag = sample.pkg.pressure.imag[lowerOffset]
-            + (sample.pkg.pressure.imag[upperOffset] - sample.pkg.pressure.imag[lowerOffset]) * mix;
+          const excitationIndices = logicalExcitationIndices(sample.pkg);
+          const [lowerReal, lowerImag] = patternPressureSample(
+            sample.pkg,
+            lower,
+            sample.directionIndex,
+            excitationIndices,
+          );
+          const [upperReal, upperImag] = patternPressureSample(
+            sample.pkg,
+            upper,
+            sample.directionIndex,
+            excitationIndices,
+          );
+          const sampleReal = lowerReal + (upperReal - lowerReal) * mix;
+          const sampleImag = lowerImag + (upperImag - lowerImag) * mix;
           const scale = sample.referenceRadius / sample.distance;
           const wavenumber = (2 * Math.PI * frequency) / sample.pkg.manifest.medium.sound_speed_m_per_s;
           const propagationPhase = wavenumber * (sample.distance - sample.referenceRadius);
@@ -184,7 +231,7 @@ export function computeMixedMicrophonePatternResponses(
           const propagationImag = Math.sin(propagationPhase) * scale;
           const fieldReal = sampleReal * propagationReal - sampleImag * propagationImag;
           const fieldImag = sampleReal * propagationImag + sampleImag * propagationReal;
-          const driveMagnitude = Math.pow(10, sample.config.levelDb / 20) * sample.config.polarity;
+          const driveMagnitude = (sample.config.muted ? 0 : Math.pow(10, sample.config.levelDb / 20)) * sample.config.polarity;
           const drivePhase = 2 * Math.PI * frequency * sample.config.delayMs / 1000;
           const driveReal = driveMagnitude * Math.cos(drivePhase);
           const driveImag = driveMagnitude * Math.sin(drivePhase);
@@ -211,13 +258,19 @@ export function fieldFrameFromSpl(
   columns: number,
   rows: number,
   sampleIndices?: ArrayLike<number>,
+  pressure?: { real: ArrayLike<number>; imag: ArrayLike<number> },
 ): FieldFrame {
   const pointCount = columns * rows;
   const indices = sampleIndices ?? Array.from({ length: pointCount }, (_, index) => index);
   if (samples.length !== indices.length) {
     throw new Error("Level 2 field dimensions do not match the audience-plane samples.");
   }
+  if (pressure && (pressure.real.length !== samples.length || pressure.imag.length !== samples.length)) {
+    throw new Error("Complex field pressure dimensions do not match the audience-plane samples.");
+  }
   const values = new Float32Array(pointCount);
+  const pressureReal = new Float32Array(pointCount);
+  const pressureImag = new Float32Array(pointCount);
   const validMask = new Uint8Array(pointCount);
   const validValues = new Float32Array(samples.length);
   let sum = 0;
@@ -231,6 +284,15 @@ export function fieldFrameFromSpl(
       throw new Error("Level 2 field contains an invalid audience-plane sample index.");
     }
     values[gridIndex] = value;
+    if (pressure) {
+      const real = Number(pressure.real[sampleIndex]);
+      const imag = Number(pressure.imag[sampleIndex]);
+      if (!Number.isFinite(real) || !Number.isFinite(imag)) {
+        throw new Error("Complex field pressure contains a non-finite value.");
+      }
+      pressureReal[gridIndex] = real;
+      pressureImag[gridIndex] = imag;
+    }
     validMask[gridIndex] = 1;
     validValues[sampleIndex] = value;
     sum += value;
@@ -240,6 +302,8 @@ export function fieldFrameFromSpl(
   if (validValues.length === 0) minimum = maximum = 0;
   return {
     splDb: values,
+    pressureReal,
+    pressureImag,
     validMask,
     columns,
     rows,
@@ -318,8 +382,7 @@ export function buildPatternLookup(
   const imag = new Float32Array(real.length);
   const radius = new Float32Array(real.length);
   const directionCount = pkg.pressureShape[2];
-  const excitationCount = pkg.pressureShape[1];
-  const pressureOffset = (frequencyIndex * excitationCount + excitationIndex) * directionCount;
+  const excitationIndices = logicalExcitationIndices(pkg, excitationIndex);
 
   for (let elevationIndex = 0; elevationIndex < elevationBins; elevationIndex += 1) {
     const elevation = -Math.PI / 2 + (Math.PI * elevationIndex) / (elevationBins - 1);
@@ -343,8 +406,14 @@ export function buildPatternLookup(
         }
       }
       const lookupOffset = elevationIndex * azimuthBins + azimuthIndex;
-      real[lookupOffset] = pkg.pressure.real[pressureOffset + bestDirection];
-      imag[lookupOffset] = pkg.pressure.imag[pressureOffset + bestDirection];
+      const [sampleReal, sampleImag] = patternPressureSample(
+        pkg,
+        frequencyIndex,
+        bestDirection,
+        excitationIndices,
+      );
+      real[lookupOffset] = sampleReal;
+      imag[lookupOffset] = sampleImag;
       radius[lookupOffset] = pkg.radiiM[bestDirection];
     }
   }
@@ -412,6 +481,8 @@ export function computeFieldFrame(
 ): FieldFrame {
   const pointCount = observation.columns * observation.rows;
   const values = new Float32Array(pointCount);
+  const pressureReal = new Float32Array(pointCount);
+  const pressureImag = new Float32Array(pointCount);
   const frequency = pkg.frequenciesHz[frequencyIndex];
   const wavenumber = (2 * Math.PI * frequency) / pkg.manifest.medium.sound_speed_m_per_s;
   if (sources.length !== configs.length || sources.length === 0) {
@@ -419,7 +490,7 @@ export function computeFieldFrame(
   }
   const sourceData = sources.map((source, index) => {
     const config = configs[index];
-    const level = Math.pow(10, config.levelDb / 20) * config.polarity;
+    const level = (config.muted ? 0 : Math.pow(10, config.levelDb / 20)) * config.polarity;
     const drivePhase = 2 * Math.PI * frequency * config.delayMs / 1000;
     return {
       source,
@@ -496,6 +567,8 @@ export function computeFieldFrame(
       const magnitude = Math.max(Number.MIN_VALUE, Math.hypot(totalReal, totalImag));
       const spl = 20 * Math.log10(magnitude / PRESSURE_REFERENCE_PA);
       values[index] = spl;
+      pressureReal[index] = totalReal;
+      pressureImag[index] = totalImag;
       sum += spl;
       minimum = Math.min(minimum, spl);
       maximum = Math.max(maximum, spl);
@@ -507,6 +580,8 @@ export function computeFieldFrame(
   const populatedValues = validCount === validValues.length ? validValues : validValues.slice(0, validCount);
   return {
     splDb: values,
+    pressureReal,
+    pressureImag,
     validMask,
     columns: observation.columns,
     rows: observation.rows,
@@ -531,6 +606,8 @@ export function computeMixedFieldFrame(
   }
   const pointCount = observation.columns * observation.rows;
   const values = new Float32Array(pointCount);
+  const pressureReal = new Float32Array(pointCount);
+  const pressureImag = new Float32Array(pointCount);
   const validMask = new Uint8Array(pointCount);
   const validValues = new Float32Array(pointCount);
   const sourceData = sources.map((source, index) => {
@@ -539,7 +616,7 @@ export function computeMixedFieldFrame(
     if (!pkg) throw new Error(`Source ${config.name} references a package that is not loaded.`);
     const lookup = lookups.get(config.packageId);
     if (!lookup) throw new Error(`Source ${config.name} has no pattern lookup for its package.`);
-    const level = Math.pow(10, config.levelDb / 20) * config.polarity;
+    const level = (config.muted ? 0 : Math.pow(10, config.levelDb / 20)) * config.polarity;
     const drivePhase = 2 * Math.PI * frequencyHz * config.delayMs / 1000;
     return {
       source,
@@ -599,6 +676,8 @@ export function computeMixedFieldFrame(
       }
       const spl = 20 * Math.log10(Math.max(Number.MIN_VALUE, Math.hypot(totalReal, totalImag)) / PRESSURE_REFERENCE_PA);
       values[index] = spl;
+      pressureReal[index] = totalReal;
+      pressureImag[index] = totalImag;
       validValues[validCount++] = spl;
       sum += spl;
       minimum = Math.min(minimum, spl);
@@ -609,6 +688,8 @@ export function computeMixedFieldFrame(
   const populatedValues = validCount === validValues.length ? validValues : validValues.slice(0, validCount);
   return {
     splDb: values,
+    pressureReal,
+    pressureImag,
     validMask,
     columns: observation.columns,
     rows: observation.rows,

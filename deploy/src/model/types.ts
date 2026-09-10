@@ -29,6 +29,13 @@ export interface SpeakerPackageManifest {
     sound_speed_m_per_s: number;
     density_kg_per_m3: number;
   };
+  physical_system?: {
+    metadata?: {
+      speaker_export_symmetry_expansion?: {
+        excitation_port_source_ids?: Record<string, string>;
+      };
+    };
+  };
 }
 
 export interface LoadedSpeakerPackage {
@@ -80,9 +87,36 @@ export interface SourceConfiguration {
   pitchDeg: number;
   yawDeg: number;
   rollDeg: number;
+  channelId: string;
   levelDb: number;
   delayMs: number;
   polarity: 1 | -1;
+  equalizer: EqualizerConfiguration;
+  muted?: boolean;
+}
+
+export interface EqualizerConfiguration {
+  filters: EqualizerFilter[];
+}
+
+export interface EqualizerFilter {
+  id: string;
+  type: "peq" | "lowpass" | "highpass" | "low-shelf" | "high-shelf" | "allpass";
+  enabled: boolean;
+  frequencyHz: number;
+  gainDb: number;
+  q: number;
+}
+
+export interface DeployChannel {
+  id: string;
+  name: string;
+  color: string;
+  levelDb: number;
+  delayMs: number;
+  polarity: 1 | -1;
+  muted: boolean;
+  equalizer: EqualizerConfiguration;
 }
 
 export interface SpeakerInstance {
@@ -128,6 +162,9 @@ export interface ObservationPlane {
   heatmapMinimumDb: number;
   heatmapMaximumDb: number;
   heatmapBandingDb: number;
+  displayMode: "spl" | "real_pressure" | "imaginary_pressure";
+  pressureScalePa: number;
+  phaseAnimationSpeedHz: number;
 }
 
 export interface PatternLookup {
@@ -140,6 +177,8 @@ export interface PatternLookup {
 
 export interface FieldFrame {
   splDb: Float32Array;
+  pressureReal: Float32Array;
+  pressureImag: Float32Array;
   validMask: Uint8Array;
   columns: number;
   rows: number;
@@ -183,6 +222,13 @@ export interface MicrophoneSweepResult {
   microphone_ids: string[];
   spl_db: number[][];
   pressure: { real: number[][]; imag: number[][] };
+  transducer_ids: string[];
+  transducer_names: string[];
+  transducer_velocity: { real: number[][]; imag: number[][] };
+  speaker_ids: string[];
+  speaker_names: string[];
+  speaker_voltage: { real: number[][]; imag: number[][] };
+  speaker_current: { real: number[][]; imag: number[][] };
   completed_count: number;
   total_count: number;
   pipeline?: Record<string, number>;

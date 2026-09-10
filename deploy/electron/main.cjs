@@ -503,12 +503,14 @@ function createWindow() {
             requestAnimationFrame(() => {
               const altDisablesSnap = viewport?.getAttribute('data-angle-snap-disabled');
               window.dispatchEvent(new KeyboardEvent('keyup', { key: 'Alt', bubbles: true }));
-              resolve({
-                translateMode,
-                rotateMode,
-                altDisablesSnap,
-                grabPointCount: viewport?.getAttribute('data-grab-point-count')
-              });
+              window.dispatchEvent(new KeyboardEvent('keydown', { key: 'q', bubbles: true }));
+              requestAnimationFrame(() => resolve({
+                  translateMode,
+                  rotateMode,
+                  altDisablesSnap,
+                  selectMode: viewport?.getAttribute('data-transform-mode'),
+                  grabPointCount: viewport?.getAttribute('data-grab-point-count')
+                }));
             });
           });
         });
@@ -631,6 +633,86 @@ function createWindow() {
           });
         });
       })`);
+      const traceFilterInteraction = await window.webContents.executeJavaScript(`new Promise((resolve) => {
+        const checkbox = document.querySelector('.trace-filter input[type="checkbox"]');
+        const count = () => document.querySelectorAll('.pattern-trace').length;
+        const before = count();
+        checkbox?.click();
+        requestAnimationFrame(() => {
+          const afterHide = count();
+          checkbox?.click();
+          requestAnimationFrame(() => resolve({
+            available: Boolean(checkbox),
+            filterRows: document.querySelectorAll('.trace-filter-row').length,
+            before,
+            afterHide,
+            afterRestore: count()
+          }));
+        });
+      })`);
+      if (!traceFilterInteraction.available || traceFilterInteraction.afterHide !== 0 || traceFilterInteraction.afterRestore !== traceFilterInteraction.before) {
+        throw new Error("Plot trace visibility filter did not hide and restore its line.");
+      }
+      const chartResizeInteraction = await window.webContents.executeJavaScript(`new Promise((resolve) => {
+        const shell = document.querySelector('.app-shell');
+        const sample = (height) => new Promise((sampleResolve) => {
+          shell?.style.setProperty('--analysis-drawer-height', height + 'px');
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            const svg = document.querySelector('.response-chart');
+            const labels = Array.from(svg?.querySelectorAll('.axis-title') || []);
+            const svgBounds = svg?.getBoundingClientRect();
+            const measurements = labels.map((label) => {
+              const bounds = label.getBoundingClientRect();
+              return {
+                text: label.textContent?.trim() || '',
+                width: Number(bounds.width.toFixed(2)),
+                height: Number(bounds.height.toFixed(2)),
+                inside: Boolean(svgBounds) && bounds.left >= svgBounds.left - 0.5 && bounds.right <= svgBounds.right + 0.5 && bounds.top >= svgBounds.top - 0.5 && bounds.bottom <= svgBounds.bottom + 0.5
+              };
+            });
+            sampleResolve({ height: Number(svgBounds?.height.toFixed(2) || 0), measurements });
+          }));
+        });
+        (async () => {
+          const compact = await sample(180);
+          const expanded = await sample(420);
+          const stable = compact.measurements.every((measurement, index) => {
+            const comparison = expanded.measurements[index];
+            return comparison && Math.abs(measurement.width - comparison.width) <= 1 && Math.abs(measurement.height - comparison.height) <= 1;
+          });
+          resolve({ compact, expanded, stable, allInside: [...compact.measurements, ...expanded.measurements].every((measurement) => measurement.inside) });
+        })();
+      })`);
+      if (!chartResizeInteraction.stable || !chartResizeInteraction.allInside) {
+        throw new Error("Plot axis labels changed size or left the SVG bounds during drawer resize.");
+      }
+      let emptySourceInteraction = null;
+      if (!level2Smoke) {
+        emptySourceInteraction = await window.webContents.executeJavaScript(`new Promise((resolve) => {
+          const sourceRows = Array.from(document.querySelectorAll('.tree-button[data-object-id^="subwoofer-"]'));
+          sourceRows.forEach((row, index) => row.dispatchEvent(new MouseEvent('click', { bubbles: true, ctrlKey: index > 0 })));
+          requestAnimationFrame(() => {
+            const remove = document.querySelector('button[aria-label="Remove selected objects"]');
+            const removeEnabledForAll = !remove?.disabled;
+            remove?.click();
+            requestAnimationFrame(() => {
+              const sourceCountAfterRemoveAll = document.querySelectorAll('.tree-button[data-object-id^="subwoofer-"]').length;
+              const solveStatusAfterRemoveAll = document.querySelector('.solve-status strong')?.textContent?.trim() || '';
+              const add = document.querySelector('button[aria-label="Add speaker"]');
+              add?.click();
+              requestAnimationFrame(() => {
+                add?.click();
+                requestAnimationFrame(() => resolve({
+                  removeEnabledForAll,
+                  sourceCountAfterRemoveAll,
+                  solveStatusAfterRemoveAll,
+                  sourceCountAfterRestore: document.querySelectorAll('.tree-button[data-object-id^="subwoofer-"]').length
+                }));
+              });
+            });
+          });
+        })`);
+      }
       let level2Move = null;
       if (level2Smoke) {
         level2Move = await window.webContents.executeJavaScript(`new Promise((resolve) => {
@@ -668,6 +750,20 @@ function createWindow() {
           });
         })`);
       }
+      const paneLayoutInteraction = await window.webContents.executeJavaScript(`(() => {
+        const properties = document.querySelector('.right-panel')?.getBoundingClientRect();
+        const plots = document.querySelector('.analysis-drawer')?.getBoundingClientRect();
+        return {
+          propertiesReachesBottom: Boolean(properties) && Math.abs(properties.bottom - window.innerHeight) <= 1,
+          plotsEndBeforeProperties: Boolean(properties && plots) && plots.right <= properties.left + 1,
+          propertiesBottom: Number(properties?.bottom.toFixed(2) || 0),
+          plotsRight: Number(plots?.right.toFixed(2) || 0),
+          propertiesLeft: Number(properties?.left.toFixed(2) || 0)
+        };
+      })()`);
+      if (!paneLayoutInteraction.propertiesReachesBottom || !paneLayoutInteraction.plotsEndBeforeProperties) {
+        throw new Error("Properties and plot panes did not occupy their requested grid regions.");
+      }
       const snapshot = await window.webContents.executeJavaScript(`({
         title: document.title,
         shell: Boolean(document.querySelector('.app-shell')),
@@ -685,13 +781,13 @@ function createWindow() {
         solveStatus: document.querySelector('.solve-status strong')?.textContent,
         solveError: document.querySelector('.error-toast span')?.textContent || null
       })`);
-      console.log(JSON.stringify({ ...snapshot, openProjectInteraction, packageImportInteraction, rigidMeshInteraction, transformInteraction, planeResolutionInteraction, sceneObjectInteraction, level2Move, consoleErrors }));
+      console.log(JSON.stringify({ ...snapshot, openProjectInteraction, packageImportInteraction, rigidMeshInteraction, transformInteraction, planeResolutionInteraction, sceneObjectInteraction, traceFilterInteraction, chartResizeInteraction, emptySourceInteraction, paneLayoutInteraction, level2Move, consoleErrors }));
       app.quit();
     });
     setTimeout(() => {
       console.error("Deploy desktop smoke test timed out.");
       app.exit(1);
-    }, benchmarkLevel2 ? 720000 : level2Smoke ? 130000 : 30000).unref();
+    }, benchmarkLevel2 ? 720000 : level2Smoke ? 130000 : 60000).unref();
   }
 
   if (app.isPackaged || process.argv.includes("--built")) {

@@ -42,6 +42,7 @@ interface DesktopSolveStatus {
 interface DesktopMicrophoneSweepRequest {
   packagePath: string;
   backend: "cuda";
+  fidelity: "boundary" | "coupled";
   sources: import("./model/types").SourceConfiguration[];
   rigidObjects: DesktopRigidObject[];
   microphones: import("./model/types").MicrophoneConfiguration[];
@@ -54,6 +55,13 @@ interface DesktopMicrophoneSweepProgress {
   total_count: number;
   microphone_ids: string[];
   spl_db: number[];
+  transducer_ids: string[];
+  transducer_names: string[];
+  transducer_velocity: { real: number[]; imag: number[] };
+  speaker_ids: string[];
+  speaker_names: string[];
+  speaker_voltage: { real: number[]; imag: number[] };
+  speaker_current: { real: number[]; imag: number[] };
 }
 
 interface Window {

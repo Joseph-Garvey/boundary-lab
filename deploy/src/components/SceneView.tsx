@@ -1,5 +1,5 @@
 import { Grid, Html, OrbitControls, TransformControls } from "@react-three/drei";
-import { Canvas, type ThreeEvent, useThree } from "@react-three/fiber";
+import { Canvas, type ThreeEvent, useFrame, useThree } from "@react-three/fiber";
 import { useEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
 import {
   BufferAttribute,
@@ -15,6 +15,7 @@ import {
   Plane,
   Quaternion,
   RedFormat,
+  RGFormat,
   ShaderMaterial,
   UnsignedByteType,
   Vector2,
@@ -22,10 +23,11 @@ import {
 } from "three";
 import type { FieldFrame, LoadedSpeakerPackage, MicrophoneConfiguration, ObservationPlane, RigidMeshAsset, SpeakerInstance } from "../model/types";
 import { SOURCE_GROUND_CLEARANCE_M } from "../model/field";
-import { cabinetLocalBounds, type BoundaryMeshAsset } from "../model/cabinetPlacement";
+import { cabinetClearanceViolations, cabinetLocalBounds, type BoundaryMeshAsset } from "../model/cabinetPlacement";
 import {
   configureAxisOnlyRotation,
   groundParallelPosition,
+  matchingCornerPaddingDirections,
   paddedCornerSnapDelta,
   rotationReadout,
   stickyCornerSnapTarget,
@@ -75,6 +77,7 @@ interface SceneViewProps {
   microphones: MicrophoneConfiguration[];
   observation: ObservationPlane;
   field: FieldFrame;
+  phaseAnimationEnabled: boolean;
   selectedInstances: readonly string[];
   activeInstance: string | null;
   transformMode: SceneTransformMode;
@@ -102,6 +105,40 @@ export interface FieldTextureProfile {
 }
 
 const packageSceneBounds = cabinetLocalBounds;
+
+function instanceAxes(instance: SpeakerInstance): [Vector3, Vector3, Vector3] {
+  const rotation = new Quaternion().setFromEuler(new Euler(
+    MathUtils.degToRad(instance.pitchDeg),
+    MathUtils.degToRad(instance.yawDeg),
+    MathUtils.degToRad(instance.rollDeg),
+    "YXZ",
+  ));
+  return [
+    new Vector3(1, 0, 0).applyQuaternion(rotation),
+    new Vector3(0, 1, 0).applyQuaternion(rotation),
+    new Vector3(0, 0, 1).applyQuaternion(rotation),
+  ];
+}
+
+function cornerSigns(corner: readonly [number, number, number], bounds: SceneBounds): [number, number, number] {
+  return [
+    corner[0] === bounds.minimum[0] ? -1 : 1,
+    corner[1] === bounds.minimum[1] ? -1 : 1,
+    corner[2] === bounds.minimum[2] ? -1 : 1,
+  ];
+}
+
+function snappedPosesHaveClearance(
+  packages: readonly BoundaryMeshAsset[],
+  moving: readonly SpeakerInstance[],
+  stationary: readonly SpeakerInstance[],
+): boolean {
+  const movingIds = new Set(moving.map((instance) => instance.id));
+  const packageMap = new Map(packages.map((item) => [item.id, item]));
+  return !cabinetClearanceViolations(packageMap, [...moving, ...stationary]).some(
+    ([left, right]) => movingIds.has(left) || movingIds.has(right),
+  );
+}
 
 function cornerInWorld(
   corner: [number, number, number],
@@ -145,11 +182,16 @@ const FIELD_PLANE_VERTEX_SHADER = /* glsl */ `
 
 const FIELD_PLANE_FRAGMENT_SHADER = /* glsl */ `
   uniform sampler2D uSplMap;
+  uniform sampler2D uPressureMap;
   uniform sampler2D uValidityMap;
   uniform vec2 uTextureSize;
   uniform float uMinimumDb;
   uniform float uMaximumDb;
   uniform float uBandingDb;
+  uniform float uDisplayMode;
+  uniform float uPressureScalePa;
+  uniform float uPhaseRad;
+  uniform float uPhaseAnimationEnabled;
   varying vec2 vUv;
 
   float validityAt(vec2 uv) {
@@ -194,6 +236,32 @@ const FIELD_PLANE_FRAGMENT_SHADER = /* glsl */ `
     return weightSum > 0.0001 ? dot(samples, validWeights) / weightSum : uMinimumDb;
   }
 
+  vec2 filteredPressure(vec2 uv) {
+    vec2 samplePosition = uv * (uTextureSize - 1.0);
+    vec2 base = floor(samplePosition);
+    vec2 fraction = fract(samplePosition);
+    vec2 maximumIndex = uTextureSize - 1.0;
+    vec2 uv00 = (clamp(base, vec2(0.0), maximumIndex) + 0.5) / uTextureSize;
+    vec2 uv10 = (clamp(base + vec2(1.0, 0.0), vec2(0.0), maximumIndex) + 0.5) / uTextureSize;
+    vec2 uv01 = (clamp(base + vec2(0.0, 1.0), vec2(0.0), maximumIndex) + 0.5) / uTextureSize;
+    vec2 uv11 = (clamp(base + vec2(1.0), vec2(0.0), maximumIndex) + 0.5) / uTextureSize;
+    vec4 weights = vec4(
+      (1.0 - fraction.x) * (1.0 - fraction.y),
+      fraction.x * (1.0 - fraction.y),
+      (1.0 - fraction.x) * fraction.y,
+      fraction.x * fraction.y
+    );
+    vec4 validity = vec4(validityAt(uv00), validityAt(uv10), validityAt(uv01), validityAt(uv11));
+    vec4 validWeights = weights * validity;
+    float weightSum = dot(validWeights, vec4(1.0));
+    vec2 value =
+      texture2D(uPressureMap, uv00).rg * validWeights.x +
+      texture2D(uPressureMap, uv10).rg * validWeights.y +
+      texture2D(uPressureMap, uv01).rg * validWeights.z +
+      texture2D(uPressureMap, uv11).rg * validWeights.w;
+    return weightSum > 0.0001 ? value / weightSum : vec2(0.0);
+  }
+
   float colorPosition(float valueDb) {
     float rangeDb = max(0.0001, uMaximumDb - uMinimumDb);
     if (uBandingDb < 0.5) return clamp((valueDb - uMinimumDb) / rangeDb, 0.0, 1.0);
@@ -222,6 +290,15 @@ const FIELD_PLANE_FRAGMENT_SHADER = /* glsl */ `
     return mix(vec3(1.0, 0.0, 0.0), vec3(0.5608, 0.0, 0.0), scaled - 8.0);
   }
 
+  vec3 pressurePalette(float position) {
+    vec3 blue = vec3(0.1059, 0.3020, 0.6902);
+    vec3 neutral = vec3(0.9569, 0.9569, 0.9569);
+    vec3 red = vec3(0.7608, 0.1059, 0.1373);
+    return position < 0.5
+      ? mix(blue, neutral, position * 2.0)
+      : mix(neutral, red, (position - 0.5) * 2.0);
+  }
+
   vec3 srgbToLinear(vec3 value) {
     vec3 low = value / 12.92;
     vec3 high = pow((value + 0.055) / 1.055, vec3(2.4));
@@ -231,7 +308,19 @@ const FIELD_PLANE_FRAGMENT_SHADER = /* glsl */ `
   void main() {
     // Keep the clipping boundary discrete even though valid SPL values are smooth.
     if (nearestValidity(vUv) < 0.5) discard;
-    vec3 color = srgbToLinear(palette(colorPosition(filteredSpl(vUv))));
+    vec3 color;
+    if (uDisplayMode < 0.5) {
+      color = palette(colorPosition(filteredSpl(vUv)));
+    } else {
+      vec2 pressure = filteredPressure(vUv);
+      float valuePa = uDisplayMode < 1.5 ? pressure.x : pressure.y;
+      if (uPhaseAnimationEnabled > 0.5) {
+        valuePa = pressure.x * cos(uPhaseRad) + pressure.y * sin(uPhaseRad);
+      }
+      float position = clamp(0.5 + valuePa / (2.0 * max(0.0001, uPressureScalePa)), 0.0, 1.0);
+      color = pressurePalette(position);
+    }
+    color = srgbToLinear(color);
     gl_FragColor = vec4(color, 0.9412);
     #include <colorspace_fragment>
   }
@@ -240,6 +329,7 @@ const FIELD_PLANE_FRAGMENT_SHADER = /* glsl */ `
 function FieldPlane({
   observation,
   field,
+  phaseAnimationEnabled,
   selected,
   active,
   transformMode,
@@ -251,6 +341,7 @@ function FieldPlane({
 }: {
   observation: ObservationPlane;
   field: FieldFrame;
+  phaseAnimationEnabled: boolean;
   selected: boolean;
   active: boolean;
   transformMode: SceneTransformMode;
@@ -276,6 +367,7 @@ function FieldPlane({
     signZ: number;
   } | null>(null);
   const textureProfile = useRef<Omit<FieldTextureProfile, "commitToFrameMs"> | null>(null);
+  const phaseRad = useRef(0);
 
   const cancelResize = (flushSolve = false) => {
     const wasResizing = resizeState.current !== null;
@@ -308,6 +400,18 @@ function FieldPlane({
     spl.wrapT = ClampToEdgeWrapping;
     spl.generateMipmaps = false;
     spl.needsUpdate = true;
+    const complexPressure = new Float32Array(field.pressureReal.length * 2);
+    for (let index = 0; index < field.pressureReal.length; index += 1) {
+      complexPressure[index * 2] = field.pressureReal[index];
+      complexPressure[index * 2 + 1] = field.pressureImag[index];
+    }
+    const pressure = new DataTexture(complexPressure, field.columns, field.rows, RGFormat, FloatType);
+    pressure.minFilter = NearestFilter;
+    pressure.magFilter = NearestFilter;
+    pressure.wrapS = ClampToEdgeWrapping;
+    pressure.wrapT = ClampToEdgeWrapping;
+    pressure.generateMipmaps = false;
+    pressure.needsUpdate = true;
     const validity = new DataTexture(field.validMask, field.columns, field.rows, RedFormat, UnsignedByteType);
     validity.minFilter = NearestFilter;
     validity.magFilter = NearestFilter;
@@ -317,19 +421,24 @@ function FieldPlane({
     validity.needsUpdate = true;
     textureProfile.current = {
       pointCount: field.columns * field.rows,
-      textureBytes: field.splDb.byteLength + field.validMask.byteLength,
+      textureBytes: field.splDb.byteLength + complexPressure.byteLength + field.validMask.byteLength,
       rasterMs: performance.now() - rasterStarted,
     };
-    return { spl, validity };
+    return { spl, pressure, validity };
   }, [field]);
   const heatmapMaterial = useMemo(() => new ShaderMaterial({
     uniforms: {
       uSplMap: { value: textures.spl },
+      uPressureMap: { value: textures.pressure },
       uValidityMap: { value: textures.validity },
       uTextureSize: { value: new Vector2(field.columns, field.rows) },
       uMinimumDb: { value: observation.heatmapMinimumDb },
       uMaximumDb: { value: observation.heatmapMaximumDb },
       uBandingDb: { value: observation.heatmapBandingDb },
+      uDisplayMode: { value: 0 },
+      uPressureScalePa: { value: observation.pressureScalePa },
+      uPhaseRad: { value: 0 },
+      uPhaseAnimationEnabled: { value: 0 },
     },
     vertexShader: FIELD_PLANE_VERTEX_SHADER,
     fragmentShader: FIELD_PLANE_FRAGMENT_SHADER,
@@ -340,6 +449,20 @@ function FieldPlane({
   heatmapMaterial.uniforms.uMinimumDb.value = observation.heatmapMinimumDb;
   heatmapMaterial.uniforms.uMaximumDb.value = observation.heatmapMaximumDb;
   heatmapMaterial.uniforms.uBandingDb.value = observation.heatmapBandingDb;
+  heatmapMaterial.uniforms.uDisplayMode.value = observation.displayMode === "spl" ? 0 : observation.displayMode === "real_pressure" ? 1 : 2;
+  heatmapMaterial.uniforms.uPressureScalePa.value = observation.pressureScalePa;
+  heatmapMaterial.uniforms.uPhaseAnimationEnabled.value = phaseAnimationEnabled && observation.displayMode !== "spl" ? 1 : 0;
+
+  useEffect(() => {
+    phaseRad.current = 0;
+    heatmapMaterial.uniforms.uPhaseRad.value = 0;
+  }, [heatmapMaterial, observation.displayMode, phaseAnimationEnabled]);
+
+  useFrame((_state, delta) => {
+    if (!phaseAnimationEnabled || observation.displayMode === "spl") return;
+    phaseRad.current = (phaseRad.current + Math.PI * 2 * observation.phaseAnimationSpeedHz * delta) % (Math.PI * 2);
+    heatmapMaterial.uniforms.uPhaseRad.value = phaseRad.current;
+  });
 
   useEffect(() => {
     const profile = textureProfile.current;
@@ -357,6 +480,7 @@ function FieldPlane({
 
   useEffect(() => () => {
     textures.spl.dispose();
+    textures.pressure.dispose();
     textures.validity.dispose();
   }, [textures]);
 
@@ -687,14 +811,25 @@ function SpeakerGeometry({
       ? probePoint.sub(drag.startProbePoint)
       : pointerDelta;
     const targetCorners: CornerSnapTarget[] = [];
+    const movingBounds = packageSceneBounds(pkg);
+    const movingSigns = cornerSigns(drag.corner, movingBounds);
+    const movingAxes = instanceAxes(instance);
     for (const other of allInstances) {
       if (movingInstanceIds.includes(other.id)) continue;
       const targetPackage = packages.find((candidate) => candidate.id === other.packageId) ?? pkg;
-      for (const [cornerIndex, targetCorner] of packageSceneBounds(targetPackage).corners.entries()) {
+      const targetBounds = packageSceneBounds(targetPackage);
+      const targetAxes = instanceAxes(other);
+      for (const [cornerIndex, targetCorner] of targetBounds.corners.entries()) {
         targetCorners.push({
           key: `${other.id}:${cornerIndex}`,
           position: cornerInWorld(targetCorner, other),
           objectCenter: new Vector3(...other.position),
+          paddingDirections: matchingCornerPaddingDirections(
+            movingSigns,
+            movingAxes,
+            cornerSigns(targetCorner, targetBounds),
+            targetAxes,
+          ),
         });
       }
     }
@@ -707,8 +842,6 @@ function SpeakerGeometry({
       viewport,
       drag.snapKey,
     );
-    drag.snapKey = snapTarget?.key ?? null;
-    setSnapHighlight(snapTarget?.position.clone() ?? null);
     const snappedDelta = paddedCornerSnapDelta(
       cornerInWorld(drag.corner, instance, drag.startPosition),
       drag.startObjectCenter,
@@ -718,6 +851,17 @@ function SpeakerGeometry({
     );
     const snapped = groundParallelPosition(drag.startPosition, snappedDelta);
     snapped[1] += snappedDelta.y;
+    const snappedInstance = { ...instance, position: snapped };
+    const stationary = allInstances.filter((other) => !movingInstanceIds.includes(other.id));
+    const validSnap = snapTarget && snappedPosesHaveClearance(packages, [snappedInstance], stationary);
+    drag.snapKey = validSnap ? snapTarget.key : null;
+    setSnapHighlight(validSnap ? snapTarget.position.clone() : null);
+    if (snapTarget && !validSnap) {
+      const unsnapped = groundParallelPosition(drag.startPosition, pointerDelta);
+      snapped[0] = unsnapped[0];
+      snapped[1] = unsnapped[1];
+      snapped[2] = unsnapped[2];
+    }
     onTransform({
       positionX: snapped[0],
       positionHeightM: snapped[1],
@@ -1185,14 +1329,31 @@ function SpeakerSelectionControls({
       ? probePoint.sub(drag.startProbePoint)
       : rawDelta;
     const targetCorners: CornerSnapTarget[] = [];
+    const movingSigns = cornerSigns(
+      [drag.startCorner.x, drag.startCorner.y, drag.startCorner.z],
+      bounds,
+    );
+    const movingAxes: [Vector3, Vector3, Vector3] = [
+      new Vector3(1, 0, 0),
+      new Vector3(0, 1, 0),
+      new Vector3(0, 0, 1),
+    ];
     for (const other of allInstances) {
       if (instances.some((instance) => instance.id === other.id)) continue;
       const targetPackage = packages.find((pkg) => pkg.id === other.packageId) ?? packages[0];
-      for (const [cornerIndex, targetCorner] of packageSceneBounds(targetPackage).corners.entries()) {
+      const targetBounds = packageSceneBounds(targetPackage);
+      const targetAxes = instanceAxes(other);
+      for (const [cornerIndex, targetCorner] of targetBounds.corners.entries()) {
         targetCorners.push({
           key: `${other.id}:${cornerIndex}`,
           position: cornerInWorld(targetCorner, other),
           objectCenter: new Vector3(...other.position),
+          paddingDirections: matchingCornerPaddingDirections(
+            movingSigns,
+            movingAxes,
+            cornerSigns(targetCorner, targetBounds),
+            targetAxes,
+          ),
         });
       }
     }
@@ -1205,8 +1366,6 @@ function SpeakerSelectionControls({
       viewport,
       drag.snapKey,
     );
-    drag.snapKey = snapTarget?.key ?? null;
-    setSnapHighlight(snapTarget?.position.clone() ?? null);
     const snappedDelta = paddedCornerSnapDelta(
       drag.startCorner,
       drag.startCenter,
@@ -1214,7 +1373,15 @@ function SpeakerSelectionControls({
       probeDelta,
       snapTarget,
     );
-    emitTranslation(drag.instances, snappedDelta);
+    const snappedInstances = drag.instances.map((start) => ({
+      ...start,
+      position: new Vector3(...start.position).add(snappedDelta).toArray() as [number, number, number],
+    }));
+    const stationary = allInstances.filter((other) => !instances.some((moving) => moving.id === other.id));
+    const validSnap = snapTarget && snappedPosesHaveClearance(packages, snappedInstances, stationary);
+    drag.snapKey = validSnap ? snapTarget.key : null;
+    setSnapHighlight(validSnap ? snapTarget.position.clone() : null);
+    emitTranslation(drag.instances, snapTarget && !validSnap ? rawDelta : snappedDelta);
   };
 
   const finishHandlePointer = (event: ThreeEvent<PointerEvent>) => {
@@ -1421,6 +1588,7 @@ function AcousticScene(props: SceneViewProps) {
       <FieldPlane
         observation={props.observation}
         field={props.field}
+        phaseAnimationEnabled={props.phaseAnimationEnabled}
         selected={selectedInstances.has("audience-plane")}
         active={props.activeInstance === "audience-plane"}
         transformMode={props.transformMode}

@@ -1,6 +1,8 @@
 import { Square, Waves } from "lucide-react";
 import { useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import type { MicrophoneResponseSet } from "../model/types";
+import { TraceVisibilityFilter } from "./TraceVisibilityFilter";
+import { usePlotDimensions } from "./usePlotDimensions";
 
 const TRACE_COLORS = ["#ffdf00", "#00dfff", "#ff6f00", "#7fe35b", "#e08cff", "#ff748c"];
 const AUDIO_FREQUENCY_MINIMUM_HZ = 20;
@@ -38,7 +40,8 @@ export function MicrophoneResponsePlot({
   frequencyPosition,
   frequencyCount,
   onFrequencyPositionChange,
-  canCalculateBem,
+  canCalculatePressure,
+  calculationLabel,
   calculating,
   completedCount,
   totalCount,
@@ -50,18 +53,19 @@ export function MicrophoneResponsePlot({
   frequencyPosition: number;
   frequencyCount: number;
   onFrequencyPositionChange: (position: number) => void;
-  canCalculateBem: boolean;
+  canCalculatePressure: boolean;
+  calculationLabel: string;
   calculating: boolean;
   completedCount: number;
   totalCount: number;
   onCalculateOrStop: () => void;
 }) {
-  const width = 1000;
-  const height = 240;
-  const padding = { left: 48, right: 86, top: 13, bottom: 30 };
+  const { ref: chartRef, width, height } = usePlotDimensions();
+  const padding = { left: 48, right: 86, top: 13, bottom: 34 };
   const [frequencyMaximum, setFrequencyMaximum] = useState<2000 | 20000>(2000);
   const [crosshair, setCrosshair] = useState<{ frequencyHz: number; splDb: number } | null>(null);
   const [crosshairDragging, setCrosshairDragging] = useState(false);
+  const [hiddenTraceIds, setHiddenTraceIds] = useState<Set<string>>(() => new Set());
   const crosshairDraggingRef = useRef(false);
   const frequencies = pattern.frequenciesHz;
   const limits = useMemo(() => {
@@ -73,8 +77,8 @@ export function MicrophoneResponsePlot({
   }, [bem, pattern]);
   const logMinimum = Math.log10(AUDIO_FREQUENCY_MINIMUM_HZ);
   const logRange = Math.max(1e-9, Math.log10(frequencyMaximum) - logMinimum);
-  const plotRight = width - padding.right;
-  const plotBottom = height - padding.bottom;
+  const plotRight = Math.max(padding.left + 1, width - padding.right);
+  const plotBottom = Math.max(padding.top + 1, height - padding.bottom);
   const x = (frequency: number) => padding.left + ((Math.log10(frequency) - logMinimum) / logRange) * (plotRight - padding.left);
   const y = (spl: number) => padding.top + ((limits[1] - spl) / RESPONSE_DB_SPAN) * (plotBottom - padding.top);
   const paths = (responseFrequencies: Float64Array, values: Float32Array) => {
@@ -105,6 +109,12 @@ export function MicrophoneResponsePlot({
   const xMajorTicks = AUDIO_FREQUENCY_MAJOR_TICKS_HZ.filter((frequency) => frequency <= frequencyMaximum);
   const xMinorTicks = logarithmicMinorTicks(frequencyMaximum);
   const cursorX = x(Math.max(AUDIO_FREQUENCY_MINIMUM_HZ, Math.min(frequencyMaximum, currentFrequencyHz)));
+  const toggleTrace = (id: string) => setHiddenTraceIds((current) => {
+    const next = new Set(current);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    return next;
+  });
 
   const updateCrosshair = (event: ReactPointerEvent<SVGSVGElement>) => {
     const bounds = event.currentTarget.getBoundingClientRect();
@@ -163,19 +173,20 @@ export function MicrophoneResponsePlot({
         </label>
         <button
           className={`bem-pressure-button ${calculating ? "stop" : ""}`}
-          disabled={!calculating && !canCalculateBem}
+          disabled={!calculating && !canCalculatePressure}
           onClick={onCalculateOrStop}
-        >{calculating ? <Square size={11} fill="currentColor" /> : <Waves size={12} />} {calculating ? `Stop ${completedCount}/${totalCount}` : "Calculate BEM Pressure"}</button>
+        >{calculating ? <Square size={11} fill="currentColor" /> : <Waves size={12} />} {calculating ? `Stop ${completedCount}/${totalCount}` : calculationLabel}</button>
       </div>
       <div className="response-content">
         {pattern.traces.length === 0 ? (
           <div className="response-empty">Add a microphone to display its package-derived frequency response.</div>
         ) : (
-          <>
+          <div className="response-plot-layout">
+            <div className="response-plot-area">
             <svg
+              ref={chartRef}
               className={`response-chart ${crosshairDragging ? "dragging" : ""}`}
               viewBox={`0 0 ${width} ${height}`}
-              preserveAspectRatio="none"
               role="img"
               aria-label="Microphone frequency response plot. Drag inside the plot for frequency and SPL coordinates; double-click to clear the crosshair."
               data-frequency-maximum-hz={frequencyMaximum}
@@ -198,16 +209,17 @@ export function MicrophoneResponsePlot({
               {xMajorTicks.map((tick) => (
                 <g key={tick}>
                   <line x1={x(tick)} x2={x(tick)} y1={padding.top} y2={plotBottom} className="plot-grid major" />
-                  <text x={x(tick)} y={height - 14} textAnchor="middle">{formatFrequency(tick)}</text>
+                  <text x={x(tick)} y={height - 18} textAnchor="middle">{formatFrequency(tick)}</text>
                 </g>
               ))}
-              <text x={(padding.left + plotRight) / 2} y={height - 3} textAnchor="middle" className="axis-title">Frequency (Hz)</text>
+              <text x={(padding.left + plotRight) / 2} y={height - 5} textAnchor="middle" className="axis-title">Frequency (Hz)</text>
               <g clipPath="url(#microphone-response-clip)">
                 <line x1={cursorX} x2={cursorX} y1={padding.top} y2={plotBottom} className="frequency-cursor" />
-                {pattern.traces.flatMap((trace, index) => paths(pattern.frequenciesHz, trace.splDb).map((path, pathIndex) => (
+                {pattern.traces.flatMap((trace, index) => hiddenTraceIds.has(trace.microphoneId) ? [] : paths(pattern.frequenciesHz, trace.splDb).map((path, pathIndex) => (
                   <path key={`pattern-${trace.microphoneId}-${pathIndex}`} d={path} stroke={TRACE_COLORS[index % TRACE_COLORS.length]} className="pattern-trace" />
                 )))}
                 {bem && pattern.traces.flatMap((trace, index) => {
+                  if (hiddenTraceIds.has(trace.microphoneId)) return [];
                   const values = bem.traces.get(trace.microphoneId);
                   return values ? paths(bem.frequenciesHz, values).map((path, pathIndex) => (
                     <path key={`bem-${trace.microphoneId}-${pathIndex}`} d={path} stroke={TRACE_COLORS[index % TRACE_COLORS.length]} className="bem-trace" />
@@ -224,12 +236,9 @@ export function MicrophoneResponsePlot({
                 <rect x={padding.left - crosshairYLabelWidth - 3} y={crosshairYLabelY} width={crosshairYLabelWidth} height={16} />
                 <text x={padding.left - crosshairYLabelWidth / 2 - 3} y={crosshairYLabelY + 11} textAnchor="middle">{crosshair.splDb.toFixed(1)}</text>
               </g>}
-              <text x={13} y={padding.top + 8} transform={`rotate(-90 13 ${padding.top + 8})`} className="axis-title">SPL (dB)</text>
+              <text x={13} y={(padding.top + plotBottom) / 2} transform={`rotate(-90 13 ${(padding.top + plotBottom) / 2})`} textAnchor="middle" className="axis-title">SPL (dB)</text>
             </svg>
             <div className="response-legend">
-              {pattern.traces.map((trace, index) => (
-                <span key={trace.microphoneId}><i style={{ background: TRACE_COLORS[index % TRACE_COLORS.length] }} />{trace.microphoneName}</span>
-              ))}
               <em><b className="line-sample pattern" />Pattern</em>
               {bem && <em><b className="line-sample bem" />BEM</em>}
             </div>
@@ -239,7 +248,13 @@ export function MicrophoneResponsePlot({
               title={`Switch frequency axis to 20 Hz–${frequencyMaximum === 2000 ? "20 kHz" : "2 kHz"}`}
               onClick={() => setFrequencyMaximum((current) => current === 2000 ? 20000 : 2000)}
             >20 Hz–{frequencyMaximum === 2000 ? "2 kHz" : "20 kHz"}</button>
-          </>
+            </div>
+            <TraceVisibilityFilter
+              items={pattern.traces.map((trace, index) => ({ id: trace.microphoneId, name: trace.microphoneName, color: TRACE_COLORS[index % TRACE_COLORS.length] }))}
+              hiddenIds={hiddenTraceIds}
+              onToggle={toggleTrace}
+            />
+          </div>
         )}
       </div>
     </div>

@@ -31,6 +31,8 @@ const {
   createDeployProject,
   parseDeployProject,
   serializeDeployProject,
+  createDefaultChannel,
+  DEFAULT_CHANNEL_ID,
   loadRigidMesh,
   configureAxisOnlyRotation,
   groundParallelDelta,
@@ -123,9 +125,11 @@ const sourceConfig = {
   pitchDeg: 0,
   yawDeg: 0,
   rollDeg: 0,
+  channelId: DEFAULT_CHANNEL_ID,
   levelDb: -3,
   delayMs: 0,
   polarity: 1,
+  equalizer: { filters: [] },
 };
 const source = buildSourceInstance(sourceConfig);
 const lookup = buildPatternLookup(speaker, frequencyIndex);
@@ -133,18 +137,22 @@ const field = computeFieldFrame(
   speaker,
   [source],
   [sourceConfig],
-  { widthM: 12, depthM: 12, centerXM: 0, nearM: 2, heightM: 1.2, pitchDeg: 0, yawDeg: 0, rollDeg: 0, columns: 24, rows: 20, heatmapMinimumDb: 50, heatmapMaximumDb: 145, heatmapBandingDb: 0 },
+  { widthM: 12, depthM: 12, centerXM: 0, nearM: 2, heightM: 1.2, pitchDeg: 0, yawDeg: 0, rollDeg: 0, columns: 24, rows: 20, heatmapMinimumDb: 50, heatmapMaximumDb: 145, heatmapBandingDb: 0, displayMode: "spl", pressureScalePa: 10, phaseAnimationSpeedHz: 1 },
   frequencyIndex,
   lookup,
 );
 assert.equal(field.splDb.length, 480);
+assert.equal(field.pressureReal.length, 480);
+assert.equal(field.pressureImag.length, 480);
 assert.ok(field.splDb.every(Number.isFinite));
+assert.ok(field.pressureReal.some((value) => value !== 0));
+assert.ok(field.pressureImag.some((value) => value !== 0));
 assert.ok(Number.isFinite(field.averageDb));
 const clippedField = computeFieldFrame(
   speaker,
   [source],
   [sourceConfig],
-  { widthM: 12, depthM: 12, centerXM: 0, nearM: 2, heightM: 0, pitchDeg: 30, yawDeg: 0, rollDeg: 0, columns: 12, rows: 12, heatmapMinimumDb: 50, heatmapMaximumDb: 145, heatmapBandingDb: 0 },
+  { widthM: 12, depthM: 12, centerXM: 0, nearM: 2, heightM: 0, pitchDeg: 30, yawDeg: 0, rollDeg: 0, columns: 12, rows: 12, heatmapMinimumDb: 50, heatmapMaximumDb: 145, heatmapBandingDb: 0, displayMode: "spl", pressureScalePa: 10, phaseAnimationSpeedHz: 1 },
   frequencyIndex,
   lookup,
 );
@@ -166,7 +174,7 @@ const mixedField = computeMixedFieldFrame(
   packageLookups,
   [source, buildSourceInstance(secondSourceConfig)],
   [sourceConfig, secondSourceConfig],
-  { widthM: 12, depthM: 12, centerXM: 0, nearM: 2, heightM: 1.2, pitchDeg: 0, yawDeg: 0, rollDeg: 0, columns: 18, rows: 16, heatmapMinimumDb: 50, heatmapMaximumDb: 145, heatmapBandingDb: 0 },
+  { widthM: 12, depthM: 12, centerXM: 0, nearM: 2, heightM: 1.2, pitchDeg: 0, yawDeg: 0, rollDeg: 0, columns: 18, rows: 16, heatmapMinimumDb: 50, heatmapMaximumDb: 145, heatmapBandingDb: 0, displayMode: "spl", pressureScalePa: 10, phaseAnimationSpeedHz: 1 },
   speaker.frequenciesHz[frequencyIndex],
 );
 assert.equal(mixedField.splDb.length, 288);
@@ -267,10 +275,11 @@ const projectText = serializeDeployProject(createDeployProject(
   "Smoke Project",
   [speaker],
   [rigidMesh],
+  [createDefaultChannel()],
   [sourceConfig],
   [{ id: "rigid-1", name: "Stage 1", assetId: rigidMesh.id, positionX: 5, positionHeightM: 0.25, positionZ: 0, pitchDeg: 0, yawDeg: 0, rollDeg: 0 }],
   [{ id: "microphone-1", name: "Microphone 1", positionX: 0, positionHeightM: 1.2, positionZ: 6 }],
-  { widthM: 12, depthM: 10, centerXM: 1, nearM: 2, heightM: 1.2, pitchDeg: 0, yawDeg: 5, rollDeg: 0, columns: 24, rows: 20, heatmapMinimumDb: 50, heatmapMaximumDb: 145, heatmapBandingDb: 0 },
+  { widthM: 12, depthM: 10, centerXM: 1, nearM: 2, heightM: 1.2, pitchDeg: 0, yawDeg: 5, rollDeg: 0, columns: 24, rows: 20, heatmapMinimumDb: 50, heatmapMaximumDb: 145, heatmapBandingDb: 0, displayMode: "real_pressure", pressureScalePa: 24, phaseAnimationSpeedHz: 1.5 },
   speaker.frequenciesHz[frequencyIndex],
   "boundary",
 ));
@@ -281,12 +290,28 @@ assert.equal(parsedProject.sources[0].packageId, speaker.id);
 assert.equal(parsedProject.packages[0].id, speaker.id);
 assert.equal(parsedProject.rigid_meshes[0].id, rigidMesh.id);
 assert.equal(parsedProject.rigid_objects[0].assetId, rigidMesh.id);
+assert.equal(parsedProject.channels[0].id, DEFAULT_CHANNEL_ID);
 assert.equal(parsedProject.microphones[0].name, "Microphone 1");
 assert.equal(parsedProject.observation_plane.columns, 24);
+assert.equal(parsedProject.observation_plane.displayMode, "real_pressure");
+assert.equal(parsedProject.observation_plane.pressureScalePa, 24);
 assert.equal(parsedProject.requested_fidelity, "boundary");
 const unsupportedProject = JSON.parse(projectText);
 unsupportedProject.schema_version = 1;
 assert.throws(() => parseDeployProject(JSON.stringify(unsupportedProject)), /Unsupported.*version 1/);
+const legacyProject = JSON.parse(projectText);
+legacyProject.schema_version = 5;
+delete legacyProject.observation_plane.displayMode;
+delete legacyProject.observation_plane.pressureScalePa;
+delete legacyProject.observation_plane.phaseAnimationSpeedHz;
+const migratedProject = parseDeployProject(JSON.stringify(legacyProject));
+assert.equal(migratedProject.schema_version, 7);
+assert.equal(migratedProject.channels[0].id, DEFAULT_CHANNEL_ID);
+assert.equal(migratedProject.observation_plane.displayMode, "spl");
+assert.equal(migratedProject.observation_plane.pressureScalePa, 10);
+const emptySceneProject = JSON.parse(projectText);
+emptySceneProject.sources = [];
+assert.equal(parseDeployProject(JSON.stringify(emptySceneProject)).sources.length, 0);
 const incompleteProject = JSON.parse(projectText);
 delete incompleteProject.observation_plane.heatmapMinimumDb;
 assert.throws(() => parseDeployProject(JSON.stringify(incompleteProject)), /heatmapMinimumDb/);
