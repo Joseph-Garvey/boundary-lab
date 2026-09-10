@@ -85,6 +85,22 @@ class _FakeAthProcess:
         return self.returncode
 
 
+# TO REVISIT: this test fails on any Linux or macOS host that has Wine installed.
+#
+# `_ath_process_command` in src/blab/ath.py prepends the Wine executable when
+# `sys.platform` is in WINE_PLATFORMS = {"linux", "darwin"}, so the real command
+# is ["/opt/homebrew/bin/wine", ath_exe, config, "-b"]. The assertion below
+# expects ["ath_exe", config, "-b"], which is only correct on Windows.
+#
+# The production code is right and Wine is a supported, documented setup on both
+# platforms, so this is a test-only problem. It passes today on a Mac *without*
+# Wine only because `shutil.which("wine")` returns None and the code raises
+# before the assertion is reached in other tests.
+#
+# The fix is to assert against the platform's expected command rather than
+# hard-coding the Windows form: either monkeypatch `shutil.which` to control the
+# lookup, or build the expectation with `_ath_process_command` itself and assert
+# the tail of the argument list.
 def test_ath_process_runner_captures_blaba_output_and_launches_gmsh_worker(tmp_path: Path, monkeypatch) -> None:
     ath_dir = tmp_path / "ath"
     ath_dir.mkdir()
@@ -903,9 +919,7 @@ def test_group_delay_combines_standard_crossover_and_configured_delay() -> None:
     assert group_delay is not None
     solved_frequencies, _names, values_ms = group_delay
     cutoff_rad_s = 2.0 * np.pi * cutoff_hz
-    crossover_delay_ms = (
-        cutoff_rad_s / (cutoff_rad_s**2 + (2.0 * np.pi * solved_frequencies) ** 2) * 1000.0
-    )
+    crossover_delay_ms = cutoff_rad_s / (cutoff_rad_s**2 + (2.0 * np.pi * solved_frequencies) ** 2) * 1000.0
     np.testing.assert_allclose(
         values_ms[:, 1:-1],
         np.broadcast_to(

@@ -17,18 +17,25 @@ details, see [Inputs and Outputs](Inputs%20and%20Outputs.md).
 ## Production paths at a glance
 
 Coupled application solves require **BEAT Engine (CPU)**,
-**BEAT Engine (Nvidia CUDA)**, or **BEAT Engine (AMD ROCm)**. They use
-`Float32/ComplexF32`, solve all configured excitation ports as independent
-reference bases, and stream one result per frequency.
+**BEAT Engine (Nvidia CUDA)**, **BEAT Engine (AMD ROCm)**, or **BEAT Engine
+(Apple Metal)**. They use `Float32/ComplexF32`, solve all configured excitation
+ports as independent reference bases, and stream one result per frequency.
 
-| | BEAT Engine CPU | BEAT Engine Nvidia CUDA | BEAT Engine AMD ROCm |
-|---|---|---|---|
-| FEM matrices | Sparse assembly on CPU | Sparse assembly on CPU, copied to GPU | Sparse assembly and interior factorization on CPU |
-| BEM operators | Assembled on CPU | Assembled on GPU | Assembled on GPU |
-| Coupled system | Schur-condensed acoustic/electromechanical system on CPU | Schur-condensed acoustic/electromechanical system on GPU | Schur-condensed retained system uploaded to GPU |
-| Factorization | UMFPACK interior Schur complement plus CPU dense LU | cuDSS plus GPU dense LU when condensed; GPU dense LU when monolithic | UMFPACK interior Schur complement plus rocSOLVER dense LU |
-| Exterior field | Evaluated on CPU | Evaluated on GPU | Evaluated on GPU |
-| Default Julia threads | 8 | 4 | 4 |
+| | BEAT Engine CPU | BEAT Engine Nvidia CUDA | BEAT Engine AMD ROCm | BEAT Engine Apple Metal |
+|---|---|---|---|---|
+| FEM matrices | Sparse assembly on CPU | Sparse assembly on CPU, copied to GPU | Sparse assembly and interior factorization on CPU | Sparse assembly and interior factorization on CPU |
+| BEM operators | Assembled on CPU | Assembled on GPU | Assembled on GPU | Assembled on GPU |
+| Coupled system | Schur-condensed acoustic/electromechanical system on CPU | Schur-condensed acoustic/electromechanical system on GPU | Schur-condensed retained system uploaded to GPU | Schur-condensed retained system on CPU |
+| Factorization | UMFPACK interior Schur complement plus CPU dense LU | cuDSS plus GPU dense LU when condensed; GPU dense LU when monolithic | UMFPACK interior Schur complement plus rocSOLVER dense LU | UMFPACK interior Schur complement plus CPU dense LU |
+| Exterior field | Evaluated on CPU | Evaluated on GPU | Evaluated on GPU | Evaluated on GPU |
+| Default Julia threads | 8 | 4 | 4 | 8 |
+
+Metal keeps the coupled linear solve on the host deliberately. Apple Silicon
+shares one memory pool, so there is no transfer penalty to weigh, and the
+platform LAPACK `ComplexF32` factorization is faster than the device
+alternative. Metal therefore gets the CPU backend's thread default rather than
+the GPU backends' — its host stays busy. See
+[BEAT Engine Apple Metal](advanced/beat-engine-metal.md) for measurements.
 
 Production backends eliminate FEM volume-interior unknowns with an exact Schur
 complement and reconstruct eliminated FEM pressure after the coupled solve.
@@ -117,9 +124,9 @@ derivative. Differing fluids are rejected.
    offsets and transducer parameters, and assign application channels.
 6. Set **FEM Bulk Loss Factor** on any bounded region that requires volume
    damping, and optionally configure **Wall Impedance** on bounded rigid
-   surfaces. Select **BEAT Engine (CPU)**, **BEAT Engine (Nvidia CUDA)**, or
-   **BEAT Engine (AMD ROCm)** in Preferences, then choose full, X-half, or
-   XY-quarter symmetry in **Meshes**.
+   surfaces. Select **BEAT Engine (CPU)**, **BEAT Engine (Nvidia CUDA)**,
+   **BEAT Engine (AMD ROCm)**, or **BEAT Engine (Apple Metal)** in Preferences,
+   then choose full, X-half, or XY-quarter symmetry in **Meshes**.
 7. Run the normal application solve.
 
 The component editor accepts direct Re, Le, Bl, Mmd, Cms, and Rms values for an
@@ -412,7 +419,7 @@ backward sparse solve reconstructs every FEM domain's pressure. Static
 condensation changes the work and memory requirements, not the mathematical
 solution.
 
-CPU, CUDA, and ROCm production solves use the retained-surface condensed
+CPU, CUDA, ROCm, and Metal production solves use the retained-surface condensed
 formulation. The FP64 reference path and explicit full-matrix diagnostic runs
 remain monolithic.
 
@@ -637,6 +644,17 @@ rejected during application preparation or backend validation:
 - different fluid properties among coupled acoustic regions;
 - iterative, fast-multipole, or distributed coupled solution methods;
 - Bempp, ROCm, server, or exterior-local execution for a coupled physical system.
+
+> **TO REVISIT — this list contradicts the rest of the document.** The last
+> entry says ROCm cannot run a coupled physical system, but the backend table
+> near the top of this page documents ROCm coupled support in detail, and
+> `registry.py` includes `beat_rocm` in `PHYSICAL_SYSTEM_BACKEND_IDS`. The
+> entry looks like a leftover from before ROCm coupled support was added, in
+> which case it should simply be deleted. It was left in place because the code
+> and the two statements disagree, and confirming which one is intended needs
+> someone who knows the history. Metal is deliberately absent from this list:
+> it does run coupled solves. Check whether "Bempp", "server", and
+> "exterior-local" are still accurate at the same time.
 
 ## Validation and profiling
 

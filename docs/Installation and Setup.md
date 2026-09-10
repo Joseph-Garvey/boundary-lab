@@ -108,11 +108,20 @@ The xcb libraries in the Linux prerequisite command are required for this
 backend. Avoid setting `QT_QPA_PLATFORM` globally because it would affect every
 Qt application in the shell environment.
 
-## Ath geometry generation on Linux
+## Ath geometry generation on Linux and macOS
 
-Boundary Lab automatically invokes the bundled `ath.exe` through `wine` on
-Linux. The bundled Ath executable is 32-bit; Gmsh runs natively through the
-Python package installed with Boundary Lab.
+Boundary Lab automatically invokes the bundled `ath.exe` through `wine` on both
+Linux and macOS (`WINE_PLATFORMS = {"linux", "darwin"}` in `src/blab/ath.py`).
+It finds Wine with `shutil.which("wine")`, so any install that puts `wine` on
+`PATH` works. Gmsh runs natively through the Python package installed with
+Boundary Lab.
+
+> **TO REVISIT — the bundled executable is no longer 32-bit.** This section used
+> to state that it was, and the Debian instructions below still install
+> `wine32:i386` accordingly. `file ath/ath202608.exe` now reports
+> `PE32+ executable (console) x86-64`, so the 32-bit runtime may no longer be
+> needed on Linux. The Debian package list has not been changed because it has
+> not been retested on a 64-bit-only Wine install.
 
 On Debian or Ubuntu:
 
@@ -135,6 +144,31 @@ runtime, Wine Mono, Wine Gecko, or Winetricks package is required for Ath mesh
 generation. Gnuplot is optional and is not used by Boundary Lab's normal mesh
 generation workflow.
 
+### macOS
+
+Install Wine with Homebrew:
+
+```bash
+brew install --cask wine-stable
+```
+
+The cask symlinks `wine` into `/opt/homebrew/bin`, which is on `PATH`, so
+Boundary Lab picks it up with no further configuration. Nothing else is needed:
+no prefix setup, no `WINEPREFIX`, no Winetricks.
+
+Confirm it works by running the bundled executable directly. It should print its
+banner and a usage line:
+
+```bash
+wine ath/ath202608.exe
+```
+
+Wine prints a block of MoltenVK and Metal device information first. That output
+is normal and is not an error.
+
+Verified on an Apple M1 Pro, macOS 15.7.7, with `wine-stable` 11.0 from
+Homebrew. Rosetta 2 handles the x86-64 translation.
+
 Generated Ath GEO, diagnostic logs, and final solve-ready meshes are written
 below `runs/generated_geometry`. Gmsh meshing runs in a cancellable child
 process, and no intermediate raw mesh is written or reloaded.
@@ -150,12 +184,19 @@ BEM and coupled FEM-BEM systems, including X and XY symmetry.
 | BEAT Engine CPU | Julia and CPU BLAS/LAPACK | Yes | Yes |
 | BEAT Engine Nvidia CUDA | Julia and supported NVIDIA GPU | Yes | Yes |
 | BEAT Engine AMD ROCm | Julia, AMDGPU.jl, and a functional ROCm SDK | Yes | Yes |
+| BEAT Engine Apple Metal | Apple Silicon Mac, macOS 13+, Julia and Metal.jl | Yes | Yes |
 
 The server backend can submit exterior or coupled jobs to another Boundary Lab
 installation. The ROCm path uses GPU-resident regular and Duffy singular operator
 assembly, rocBLAS/rocSOLVER dense solves, and GPU exterior field evaluation.
 See [BEAT Engine AMD ROCm](advanced/beat-engine-rocm.md) for setup and
 validation details.
+
+The Metal path uses the same GPU-resident operator assembly and exterior field
+evaluation, and keeps the dense and coupled solves on the host because that is
+faster on unified memory. It needs no separate SDK — the driver ships with
+macOS. See [BEAT Engine Apple Metal](advanced/beat-engine-metal.md) for setup
+and validation details.
 
 ### BEAT Engine AMD ROCm on Windows
 

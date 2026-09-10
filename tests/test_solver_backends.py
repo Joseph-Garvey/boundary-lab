@@ -18,6 +18,10 @@ from blab.solvers.beat_engine_backend import (
     shutdown_beat_engine_workers,
 )
 from blab.solvers.bempp_server import BemppServerBackend, BemppServerSession
+from blab.solvers.coupled_backend import (
+    COUPLED_BEM_BACKENDS,
+    PhysicalSystemProductionBackend,
+)
 from blab.solvers.http_server import (
     HttpServerBackend,
     HttpServerSession,
@@ -27,6 +31,7 @@ from blab.solvers.http_server import (
 )
 from blab.solvers.julia_local_backend import JuliaLocalBackend
 from blab.solvers.registry import (
+    PHYSICAL_SYSTEM_BACKEND_IDS,
     available_backend_infos,
     backend_condenses_fem_interior,
     backend_info,
@@ -44,6 +49,7 @@ def test_solver_backend_registry_keeps_legacy_ids_available() -> None:
     assert labels["BEAT Engine (Nvidia CUDA)"] == "beat_cuda"
     assert labels["BEAT Engine (CPU)"] == "beat_cpu"
     assert labels["BEAT Engine (AMD ROCm)"] == "beat_rocm"
+    assert labels["BEAT Engine (Apple Metal)"] == "beat_metal"
     assert "BEAT Engine (CPU Condensed)" not in labels
     assert labels["Bempp (OpenCL CPU)"] == "local"
     assert normalize_backend_id("bempp") == "local"
@@ -59,6 +65,9 @@ def test_solver_backend_registry_keeps_legacy_ids_available() -> None:
     assert normalize_backend_id("beat_rocm") == "beat_rocm"
     assert normalize_backend_id("rocm") == "beat_rocm"
     assert normalize_backend_id("amdgpu") == "beat_rocm"
+    assert normalize_backend_id("beat_metal") == "beat_metal"
+    assert normalize_backend_id("metal") == "beat_metal"
+    assert normalize_backend_id("apple") == "beat_metal"
     assert JuliaLocalBackend is BeatEngineBackend
     assert BeatEngineRocmBackend.beat_engine_backend == "rocm"
     assert BemppServerBackend is HttpServerBackend
@@ -69,9 +78,11 @@ def test_solver_backend_registry_keeps_legacy_ids_available() -> None:
     assert backend_info("beat_cuda").capabilities.supports_symmetry is True
     assert backend_info("beat_cpu").capabilities.supports_symmetry is True
     assert backend_info("beat_rocm").capabilities.supports_symmetry is True
+    assert backend_info("beat_metal").capabilities.supports_symmetry is True
     assert "beat_cuda" in {info.backend_id for info in available_backend_infos()}
     assert "beat_cpu" in {info.backend_id for info in available_backend_infos()}
     assert "beat_rocm" in {info.backend_id for info in available_backend_infos()}
+    assert "beat_metal" in {info.backend_id for info in available_backend_infos()}
 
 
 def test_condensed_cpu_backend_id_is_a_compatibility_alias() -> None:
@@ -88,10 +99,24 @@ def test_condensed_cpu_backend_id_is_a_compatibility_alias() -> None:
     assert backend_condenses_fem_interior("beat_cpu") is True
     assert backend_condenses_fem_interior("beat_cuda") is True
     assert backend_condenses_fem_interior("beat_rocm") is True
+    assert backend_condenses_fem_interior("beat_metal") is True
 
-    for backend_id in ("beat_cpu", "beat_cuda", "beat_rocm"):
+    for backend_id in ("beat_cpu", "beat_cuda", "beat_rocm", "beat_metal"):
         assert supports_physical_system_solves(backend_id) is True
     assert supports_physical_system_solves("local") is False
+
+
+def test_every_physical_system_backend_can_build_a_coupled_backend() -> None:
+    # The registry advertising a backend for physical-system solves is not enough:
+    # the coupled adapter has its own allow-list and its own Julia project map,
+    # and both have to agree with the registry. Metal was added to the registry
+    # while coupled_backend.py still rejected it, which failed only at solve time.
+    for backend_id in sorted(PHYSICAL_SYSTEM_BACKEND_IDS):
+        bem_backend = backend_id.removeprefix("beat_")
+        assert bem_backend in COUPLED_BEM_BACKENDS, f"{backend_id} missing from COUPLED_BEM_BACKENDS"
+        backend = PhysicalSystemProductionBackend(bem_backend=bem_backend, persistent_worker=False)
+        assert backend.bem_backend == bem_backend
+        assert backend.julia_project is not None
 
 
 def test_local_backend_factory_exposes_contract_metadata() -> None:

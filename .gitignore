@@ -299,3 +299,8 @@ boundary_lab_bem_fem_lem_architecture.md
 .pytest_plane_scale_full/test_xy_stitch_candidates_use_0/ath_case_clean_reduced.msh
 .pytest_plane_scale_full/test_xy_stitch_candidates_use_0/ath_case.msh
 .pytest_plane_scale_full/test_xy_symmetry_rejects_negat0/negative_y.msh
+
+# BEAT Engine Julia sysimages: half-gigabyte build artifacts, built per machine
+# by scripts/build-beat-metal-sysimage.jl.
+src/blab/solvers/julia_*/blab-beat-*.dylib
+src/blab/solvers/julia_*/blab-beat-*.so

@@ -163,8 +163,6 @@ def test_project_cli_exposes_validate_and_solve_commands() -> None:
             "speaker.blabsp",
             "--fidelity",
             "coupled",
-            "--coupled-representation",
-            "sampled-macro",
         ]
     )
     speaker_preflight = parser.parse_args(["speaker-preflight", "speaker.blab.json", "--rom-rank", "128"])
@@ -179,7 +177,7 @@ def test_project_cli_exposes_validate_and_solve_commands() -> None:
     assert export.project_command == "export-speaker"
     assert export.output == Path("speaker.blabsp")
     assert export.fidelity == "coupled"
-    assert export.coupled_representation == "sampled-macro"
+    assert not hasattr(export, "coupled_representation")
     assert speaker_preflight.project_command == "speaker-preflight"
     assert speaker_preflight.rom_rank == 128
     assert evaluate_fem.project_command == "evaluate-fem"
@@ -227,6 +225,8 @@ def test_explicit_backend_does_not_probe_cuda(monkeypatch) -> None:
     assert resolve_headless_backend("beat_cpu") == "beat_cpu"
     assert resolve_headless_backend("beat_cuda") == "beat_cuda"
     assert resolve_headless_backend("beat_rocm") == "beat_rocm"
+    assert resolve_headless_backend("beat_metal") == "beat_metal"
+    assert resolve_headless_backend("metal") == "beat_metal"
     assert resolve_headless_backend("beat_cpu_condensed") == "beat_cpu"
 
 

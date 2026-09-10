@@ -210,19 +210,20 @@ Estimate Level 3 storage and per-frequency working sets before solving:
 blab project speaker-preflight speaker.blab.json --json
 ```
 
-Create a level 3 package with the exact frequency-parametric interior used for
-mutual coupling:
+Create a level 3 package with the rank-reduced interior model used for mutual
+coupling:
 
 ```bash
 blab project export-speaker speaker.blab.json --output speaker.blabsp --fidelity coupled
 ```
 
-Level 3 requires a coupled FEM-BEM physical system. It temporarily expands X/XY
-symmetry to a full-domain system before compilation; the project file is not
-changed. The default `exact-system` representation archives that compiled
-system and its meshes. It does not request or store a dense condensed matrix at
-every export frequency. The legacy behavior is available explicitly with
-`--coupled-representation sampled-macro`.
+Level 3 requires a coupled FEM-BEM physical system and exports a parity
+Petrov–Galerkin ROM. It temporarily expands X/XY symmetry to a full-domain
+system before compilation; the project file is not changed. The ROM preserves the source project's
+symmetry: full-domain projects use one general sector, X-symmetric projects use
+even-X and odd-X sectors, and XY-symmetric projects use four parity sectors.
+Exact-system models remain internal validation oracles and are not offered as
+user-facing speaker-package exports.
 
 The command accepts the same `--request`, `--backend`, `--julia-executable`,
 `--julia-threads`, and `--events` controls as the headless solve. It forces the

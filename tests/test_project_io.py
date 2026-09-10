@@ -19,6 +19,19 @@ def test_project_path_gets_default_suffix() -> None:
     assert normalize_project_path("speaker_project.json").name == "speaker_project.json"
 
 
+# TO REVISIT: this test fails on macOS and Linux, and passes only on Windows.
+#
+# The `imported_meshes` fixture below uses "C:/meshes/enclosure.msh" as a mesh
+# source path. On Windows that is absolute and survives the round trip
+# unchanged. On any other platform it is a *relative* path, so it gets resolved
+# against `tmp_path` and comes back as
+# "/private/var/folders/.../test_project_file_round_trip0/C:/meshes/enclosure.msh",
+# and the `loaded == payload` assertion fails.
+#
+# The round-trip logic itself is fine. Only the fixture is host-dependent. The
+# fix is to make the path host-neutral, for example `str(tmp_path / "enclosure.msh")`
+# or a plainly relative "meshes/enclosure.msh", rather than skipping the test on
+# non-Windows hosts, which would lose the coverage everywhere except Windows.
 def test_project_file_round_trip(tmp_path) -> None:
     payload = build_project_payload(
         generator_documents=[
@@ -86,9 +99,7 @@ def test_project_file_round_trip(tmp_path) -> None:
     assert loaded == payload
     assert loaded["symmetry"] == "xy"
     assert loaded["component_channel_by_id"] == {"component:woofer": "tweeter"}
-    assert loaded["max_spl_limits_by_channel"] == {
-        "tweeter": {"xmax_mm": 1.2, "pmax_w": 80.0}
-    }
+    assert loaded["max_spl_limits_by_channel"] == {"tweeter": {"xmax_mm": 1.2, "pmax_w": 80.0}}
     assert loaded["observation_planes"][0]["id"] == "plane:interior"
     assert json.loads(project_path.read_text(encoding="utf-8"))["schema_version"] == PROJECT_SCHEMA_VERSION
 

@@ -204,3 +204,75 @@ exterior and symmetry fixtures.
   propagate normally.
 - `host_staged` assembly is useful for separating GPU-kernel issues from SDK or
   linear-solver issues, but it is not the production performance path.
+
+## Known issue: the singular gather is much slower than it needs to be
+
+Not yet fixed. Recorded here so it can be picked up in a later change.
+
+`BeatEngineMetalSingular.jl` was ported from `BeatEngineRocmSingular.jl`. While
+tuning the Metal copy we found a performance bug in the shared design, fixed it
+there, and measured a 34x speed-up of the singular stage. The ROCm file still has
+the original design, so the same speed-up should be available on AMD hardware.
+
+### What is slow
+
+The singular stage runs in two parts. First, block kernels evaluate the Duffy
+quadrature for each adjacent or coincident element pair. Second, gather kernels
+add those small blocks into the four dense operator matrices.
+
+The gather kernels are the problem. `_rocm_singular_dlp_hyp_gather_kernel!`
+starts one thread for every entry of the dense matrix, and each thread searches
+the singular pair list to find out whether anything belongs in its entry. On a
+7,000-face mesh that is 12.26 million threads, each running a nested loop over
+roughly 36 element combinations, with a linear scan through
+`_rocm_find_singular_pair` for every combination.
+
+Almost all of that work is wasted. Only about 69,000 of those 12.26 million
+entries receive a correction at all, so 99.4% of the threads search, find
+nothing, and write zero.
+
+Measured on Metal before the fix, with the four kernel launches timed
+separately:
+
+| Stage | Time | Share |
+| --- | ---: | ---: |
+| Block kernels (Duffy quadrature) | 0.021 s | 3% |
+| Gather kernels | 0.728 s | 97% |
+
+The quadrature, which holds all the difficulty, was 3% of the cost. The
+bookkeeping around it was 97%.
+
+### The fix
+
+Which matrix entries receive a correction depends only on the mesh topology, the
+singular pair list, and the degree-of-freedom maps. None of that changes with
+frequency, so the search can be done once on the CPU when the cache is built,
+instead of on every frequency by millions of GPU threads.
+
+The Metal version precomputes a CSR-style contribution map in
+`_metal_singular_gather_maps`: a list of the entries that receive something, and
+for each one, a contiguous run of indices into the compact per-pair block values.
+The gather kernel then starts one thread per corrected entry and only adds up its
+own short list. No searching. The two old gather kernels collapse into one
+generic `_metal_singular_pair_gather_kernel!`, and `_metal_find_singular_pair`
+is deleted.
+
+On Metal this took the gather from 0.728 s to 0.0009 s, the singular stage from
+0.748 s to 0.022 s, and total operator assembly from 2.647 s to 1.915 s.
+Accuracy did not change beyond float summation-order noise in the eighth
+significant figure.
+
+### To port it
+
+`build_rocm_singular_correction_cache` needs the P1 and DP0 spaces so it can
+build the map, so its signature gains two arguments, as the Metal one did. The
+call sites are the equivalents of the ones changed for Metal: the image singular
+caches in `BeatEngineRocmRegular.jl`, the native assembly path in
+`BeatEngineRocmAssembly.jl`, `solver.jl`, and `coupled_solver.jl`.
+
+This has not been done because there is no AMD hardware in the development
+environment to validate it on, and an unvalidated kernel change should not ship.
+Anyone with a supported card can port the change and confirm it with
+`validate_rocm_exterior.jl`, `validate_rocm_symmetry.jl`, and
+`validate_rocm_coupled.jl`. The reasoning is written up in
+[Notes: optimising the Metal singular kernel](beat-engine-metal-singular-notes.md).

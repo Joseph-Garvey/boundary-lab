@@ -34,6 +34,7 @@ from blab.physical_model import (
 from blab.solvers.base import SolveRequest
 from blab.solvers.beat_engine_backend import (
     DEFAULT_BEAT_ENGINE_CUDA_PROJECT,
+    DEFAULT_BEAT_ENGINE_METAL_PROJECT,
     DEFAULT_BEAT_ENGINE_ROCM_PROJECT,
     BeatEngineCpuBackend,
     shutdown_beat_engine_workers,
@@ -236,6 +237,27 @@ def test_coupled_production_backend_selects_rocm_project() -> None:
     assert session.request.solver_options["bem_backend"] == "rocm"
     assert session.request.solver_options["static_condensation"] is True
     assert session.julia_project == DEFAULT_BEAT_ENGINE_ROCM_PROJECT.resolve()
+    assert session.julia_threads == 8
+
+
+def test_coupled_production_backend_selects_metal_project() -> None:
+    compiled = PhysicalSystemCompiler().compile(_fixture_system())
+    request = SystemSolveRequest(
+        compiled_system=compiled,
+        frequencies_hz=(500.0,),
+        excitation_port_ids=("excitation:radiator",),
+        outputs=(OutputRequest(id="output:fem", quantity="fem_nodal_pressure"),),
+        solver_options={"static_condensation": True},
+    )
+
+    session = CoupledProductionBackend(bem_backend="metal").create_system_session(request)
+
+    assert session.request.solver_options["precision"] == "float32"
+    assert session.request.solver_options["bem_backend"] == "metal"
+    assert session.request.solver_options["static_condensation"] is True
+    assert session.julia_project == DEFAULT_BEAT_ENGINE_METAL_PROJECT.resolve()
+    # Metal condenses and factors on the host, so it gets the CPU thread default
+    # rather than the 4 that CUDA uses.
     assert session.julia_threads == 8
 
 
@@ -1183,74 +1205,6 @@ def test_coupled_cpu_condensed_matches_cpu_monolithic() -> None:
     assert condensed.diagnostics["linear_solver"] == "cpu_umfpack_schur_plus_dense_lu"
     assert condensed.diagnostics["fem_interior_residual"] < 1e-9
     assert condensed.diagnostics["solved_system_order"] < condensed.diagnostics["full_system_order"]
-
-
-@pytest.mark.skipif(
-    os.environ.get("BLAB_RUN_COUPLED_REFERENCE") != "1",
-    reason="Set BLAB_RUN_COUPLED_REFERENCE=1 to run the Level-3 macro-model integration.",
-)
-def test_coupled_condensed_speaker_macro_replays_solved_boundary_state() -> None:
-    compiled = PhysicalSystemCompiler().compile(_bidirectional_electrodynamic_fixture_system())
-    outputs = (
-        OutputRequest(id="output:fem", quantity="fem_nodal_pressure"),
-        OutputRequest(id="output:bem", quantity="bem_boundary_pressure"),
-        OutputRequest(id="output:q", quantity="bem_boundary_neumann"),
-        OutputRequest(id="output:interface", quantity="interface_normal_derivative"),
-        OutputRequest(id="output:velocity", quantity="diaphragm_velocity"),
-        OutputRequest(id="output:current", quantity="voice_coil_current"),
-        OutputRequest(id="macro:k", quantity="speaker_macro_k"),
-        OutputRequest(id="macro:c", quantity="speaker_macro_c"),
-        OutputRequest(id="macro:d", quantity="speaker_macro_d"),
-        OutputRequest(id="macro:b", quantity="speaker_macro_b"),
-        OutputRequest(id="macro:e", quantity="speaker_macro_e"),
-    )
-    request = SystemSolveRequest(
-        compiled_system=compiled,
-        frequencies_hz=(500.0,),
-        excitation_port_ids=("excitation:radiator",),
-        outputs=outputs,
-        solver_options={
-            "quadrature_order": 1,
-            "singular_order": 1,
-            "validation_diagnostics": False,
-            "static_condensation": True,
-        },
-    )
-    (result,) = tuple(
-        CoupledProductionBackend(
-            bem_backend="cpu",
-            julia_executable=os.environ.get("BLAB_JULIA_EXE", "julia"),
-            persistent_worker=False,
-        )
-        .create_system_session(request)
-        .solve_stream()
-    )
-    quantities = {quantity.id: quantity for quantity in result.quantities}
-    retained = np.asarray(quantities["macro:k"].metadata["retained_fem_vertex_indices"], dtype=np.int64)
-    state = np.concatenate(
-        (
-            quantities["output:fem"].values[0, retained],
-            quantities["output:interface"].values[0],
-            quantities["output:velocity"].values[0],
-            quantities["output:current"].values[0],
-        )
-    )
-    pressure = quantities["output:bem"].values[0]
-    neumann = quantities["output:q"].values[0]
-    drive = np.asarray([DEFAULT_TRANSDUCER_REFERENCE_VOLTAGE_V], dtype=np.complex128)
-
-    interior_residual = (
-        quantities["macro:k"].values @ state
-        + quantities["macro:c"].values @ pressure
-        - quantities["macro:b"].values @ drive
-    )
-    neumann_residual = (
-        neumann
-        - quantities["macro:d"].values @ state
-        - quantities["macro:e"].values @ drive
-    )
-    assert np.linalg.norm(interior_residual) / max(np.linalg.norm(state), 1.0) < 1e-6
-    assert np.linalg.norm(neumann_residual) / max(np.linalg.norm(neumann), 1.0) < 1e-6
 
 
 @pytest.mark.skipif(
