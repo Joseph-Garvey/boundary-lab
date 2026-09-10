@@ -89,6 +89,9 @@ function _require_metal!()
     return nothing
 end
 
+# Apple GPUs execute in SIMD groups of 32. A threadgroup of 256 keeps eight SIMD
+# groups resident per group, which suits the arithmetic-heavy regular kernels.
+# Override with BLAB_METAL_KERNEL_GROUPSIZE when tuning a device.
 function _metal_kernel_groupsize()
     groupsize = parse(Int, get(ENV, "BLAB_METAL_KERNEL_GROUPSIZE", "256"))
     groupsize in (32, 64, 128, 256, 512, 1024) ||
