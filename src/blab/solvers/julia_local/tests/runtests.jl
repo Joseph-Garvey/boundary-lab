@@ -26,6 +26,15 @@ rocm_available() = AMDGPU_MODULE !== nothing &&
                    AMDGPU_MODULE.functional(:rocblas) &&
                    AMDGPU_MODULE.functional(:rocsolver)
 
+const METAL_MODULE = try
+    @eval import Metal
+    Metal
+catch
+    nothing
+end
+
+metal_available() = METAL_MODULE !== nothing && METAL_MODULE.functional()
+
 @testset "symmetry plane snapping" begin
     vertices = [
         SVector{3,Float64}(-1.2e-8, 0.0, 0.8),
@@ -958,6 +967,102 @@ end
         release_cuda_image_singular_correction_cache!(cuda_image_singular)
         release_operator_storage!(cuda_corrected)
         release_cuda_image_singular_correction_cache!(cuda_near)
+    end
+end
+
+@testset "metal production pipeline" begin
+    if !metal_available()
+        @test_skip "Metal unavailable; skipping Metal-only BEAT Engine tests."
+    else
+        # Each arm gets the mesh that is a fundamental domain for it. Folding
+        # mirror images onto a mesh that already spans both sides of the plane
+        # double-counts and leaves the operator near-singular.
+        for (mesh_name, symmetry_mode) in (
+            ("sample.msh", :off),
+            ("sample_half.msh", :x),
+            ("sample_quarter.msh", :xy),
+        )
+            mesh = load_gmsh22_with_tags(joinpath(@__DIR__, "..", "test_meshes", mesh_name), Float32(0.001))
+            mesh = snap_symmetry_planes(mesh, symmetry_mode)
+            validate_symmetry_fundamental_domain!(mesh, symmetry_mode)
+            p1 = build_p1_space(mesh)
+            dp0 = build_dp0_space(mesh)
+            rule = triangle_rule(Float32, 2)
+            k = Float32(2pi * 1500.0 / 343.0)
+            singular_cache = build_singular_correction_cache(mesh, 2)
+            identity_p1_p1 = assemble_l2_identity_matrix(mesh, p1, dp0, rule, :p1, :p1; symmetry_mode=symmetry_mode)
+            identity_p1_dp0 = assemble_l2_identity_matrix(mesh, p1, dp0, rule, :p1, :dp0; symmetry_mode=symmetry_mode)
+            device_cache = build_metal_regular_assembly_cache(
+                mesh, p1, dp0, rule; singular_order=2, symmetry_mode=symmetry_mode,
+            )
+            device_singular_cache = build_metal_singular_correction_cache(singular_cache)
+
+            operators = assemble_regular_galerkin_operators(
+                mesh, p1, dp0, k, rule;
+                skip_singular=false, singular_order=2, backend=:metal,
+                device_cache=device_cache, singular_cache=singular_cache,
+                device_singular_cache=device_singular_cache, symmetry_mode=symmetry_mode,
+            )
+            @test get(operators, :on_gpu, false)
+            @test operators.regular_pairs > 0
+            @test operators.singular_pairs == singular_cache.pair_count
+
+            # The coupled and exterior drivers both hand the operators to the
+            # host before the dense solve, because Metal.jl has no GPU LU.
+            host_operators = metal_host_operators(operators)
+            @test host_operators.single_layer isa Matrix{ComplexF32}
+            reference_lhs, reference_rhs_operator = BeatEngineCore.burton_miller_neumann_matrices(
+                host_operators, identity_p1_p1, identity_p1_dp0, k,
+            )
+
+            drive_count = 3
+            q_neumann = ComplexF32[
+                ComplexF32(sin(Float32(0.7 * row + 1.3 * column)), cos(Float32(0.4 * row - 0.9 * column)))
+                for row in 1:dp0.global_dof_count, column in 1:drive_count
+            ]
+            rhs_reference = reference_rhs_operator * q_neumann
+            release_operator_storage!(host_operators)
+
+            fused_matrices = Matrix{ComplexF32}[]
+            fused_rhss = Matrix{ComplexF32}[]
+            # Twice, so the assertion below is about reproducibility rather
+            # than about one lucky ordering.
+            for _ in 1:2
+                fused = assemble_burton_miller_neumann_system_metal(
+                    mesh, p1, dp0, q_neumann, k, rule;
+                    device_cache=device_cache, singular_cache=singular_cache,
+                    device_singular_cache=device_singular_cache,
+                    identity_p1_p1=identity_p1_p1, identity_p1_dp0=identity_p1_dp0,
+                    singular_order=2, symmetry_mode=symmetry_mode,
+                )
+                METAL_MODULE.synchronize()
+                push!(fused_matrices, Array(fused.matrix))
+                push!(fused_rhss, Array(fused.rhs))
+                release_metal_burton_miller_system!(fused)
+            end
+
+            @test size(fused_matrices[1]) == (p1.global_dof_count, p1.global_dof_count)
+            @test size(fused_rhss[1]) == (p1.global_dof_count, drive_count)
+
+            # The gather write-back exists so the singular correction lands in
+            # a fixed order. Bit-identical, not approximately equal: an atomic
+            # scatter fails this and the whole point of the gather is that it
+            # cannot.
+            @test fused_matrices[1] == fused_matrices[2]
+            @test fused_rhss[1] == fused_rhss[2]
+
+            lhs_scale = max(norm(reference_lhs), eps(Float32))
+            rhs_scale = max(norm(rhs_reference), eps(Float32))
+            @test norm(fused_matrices[1] - reference_lhs) / lhs_scale < 1.0f-5
+            @test norm(fused_rhss[1] - rhs_reference) / rhs_scale < 1.0f-5
+
+            pressure = lu(copy(fused_matrices[1])) \ fused_rhss[1]
+            reference_pressure = lu(copy(reference_lhs)) \ rhs_reference
+            @test norm(pressure - reference_pressure) / max(norm(reference_pressure), eps(Float32)) < 1.0f-4
+
+            release_metal_singular_correction_cache!(device_singular_cache)
+            release_metal_regular_assembly_cache!(device_cache)
+        end
     end
 end
 

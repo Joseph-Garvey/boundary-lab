@@ -199,6 +199,118 @@ factorization of frequency i on a second Julia thread
 (`BLAB_METAL_PIPELINE=0` disables it); two operator sets are then resident
 at once.
 
+## FEM static condensation
+
+Coupled solves reduce the FEM interior onto the retained interface before
+factoring. `beat_metal` is in both `PHYSICAL_SYSTEM_BACKEND_IDS` and
+`CONDENSING_BACKEND_IDS`, so `system_solve.py` requests
+`static_condensation: true` and this is the default path.
+
+Condensation is CPU work on every backend. Metal uses
+`_build_host_fem_condensation`, which partitions the FEM system, factors the
+interior block, forms the Schur complement on the host, and hands the reduced
+dense block to `_solve_host_condensed_excitations`. `condensation.backend`
+reports `:cpu_hybrid`. This is the same shape as
+`_build_rocm_hybrid_fem_condensation`, minus the upload.
+
+### Why condensation is on by default
+
+Measured on the curved-interface production fixture -- 19,492 FEM vertices,
+94,265 tetrahedra, 5,103 BEM triangles, 1,318 retained interface vertices -- at
+1 kHz, `q2/s2`, on an M1 Pro with eight Julia threads:
+
+| | Monolithic | Condensed | Ratio |
+| --- | ---: | ---: | ---: |
+| System order | 23,433 | 5,259 | 4.5x smaller |
+| Build | 96.689 s | 6.305 s | 15.3x |
+| Solve | 2.799 s | 2.185 s | 1.28x |
+| **Total** | **99.489 s** | **8.490 s** | **11.7x** |
+
+The build gap is the dense coupled matrix: 23,433 squared in `ComplexF32` is
+4.4 GB and its LU dominates everything else, against 221 MB condensed.
+Agreement between the two formulations is 1.3e-4 on FEM pressure, 1.8e-4 on BEM
+pressure, and 1.7e-4 on interface flux -- inside the 5e-4 Float32 gate used
+across the coupled validations.
+
+The condensation cost itself is reported in `condensation_timings`: partition
+0.021 s, interior UMFPACK factorization 0.931 s, blocked Schur complement
+1.799 s.
+
+### Interior solver: UMFPACK by default
+
+Condensation factors the FEM interior and then solves it against roughly one
+right-hand side per retained interface node. Nearly all of the stage is those
+triangular solves -- 98.6% of the Schur complement on `F2B_FLH`. Three settings
+are available through `BLAB_METAL_FEM_CONDENSATION`:
+
+| Value | Interior solver |
+| --- | --- |
+| `umfpack` (default) | SuiteSparse UMFPACK in `ComplexF64`, the same code the CPU and ROCm backends use. |
+| `accelerate` | Apple Accelerate sparse LU in `ComplexF32`. |
+| `accelerate_f64` | Apple Accelerate sparse LU in `ComplexF64`. |
+
+Median over warm frequencies on `F2B_FLH`, M1 Pro, eight Julia threads:
+
+| Stage | `umfpack` | `accelerate` | `accelerate_f64` |
+| --- | ---: | ---: | ---: |
+| `fem_condensation_factorization_s` | 0.326 s | **0.212 s** | 0.306 s |
+| `fem_schur_extraction_s` | 1.070 s | **0.507 s** | 1.101 s |
+| **`fem_condensation_s`** | **1.416 s** | **0.755 s** | 1.426 s |
+| `assembly_s`, whole frequency | 2.683 s | **2.008 s** | 2.663 s |
+
+`accelerate` is **1.87x** faster on condensation and 1.34x on the whole
+assembly stage. `accelerate_f64` is a wash. The two columns together say the
+important thing: **the speed-up is the precision drop, not a better solver.** In
+equal precision Accelerate and UMFPACK are the same speed, so there is no
+version of this that is both faster and equally accurate.
+
+#### Why the default is `umfpack`
+
+`accelerate` is not bit-equivalent to the default. Measured against the UMFPACK
+result on `F2B_FLH` at 50/100/200 Hz, across diaphragm velocity, voice-coil
+current, and all three exterior pressure sets:
+
+| Metric | Worst observed |
+| --- | ---: |
+| Magnitude error | 0.016 dB |
+| Phase error | 0.18 degrees |
+| Relative norm, any output quantity | 3.2e-3 |
+
+The physical error is negligible: 0.016 dB and 0.18 degrees are far below
+anything audible, and below the repeatability of a real measurement. **But
+3.2e-3 exceeds the 5e-4 relative-norm gate this project applies to its other
+coupled validations**, so enabling it by default would quietly hold the Metal
+coupled path to a looser numerical standard than every other backend.
+
+That trade may well be worth taking -- 1.87x for 0.016 dB is a good deal -- but
+it is a decision about which standard applies, not a performance tweak, so the
+default stays conservative until that is settled. See [Options: speeding up FEM
+static condensation on Apple
+Metal](beat-engine-metal-condensation-options.md) for the full argument.
+
+Note that `validate_metal_coupled.jl` does **not** discriminate between the two.
+Its fixture is small enough that both solvers agree to the same 1e-6 figures and
+the script passes under all three settings. The 3.2e-3 figure only appears on a
+production-sized interior, so re-measure on a real model rather than on the
+validation fixture.
+
+#### Tuning the Accelerate path
+
+`SparseSolve` cost grows **superlinearly** in the number of right-hand sides per
+call, which makes the block size the dominant tuning parameter. Schur wall time
+on the `F2B_FLH` interior by `BLAB_ACCELERATE_SCHUR_BLOCK`:
+
+| Block | 8 | 16 | 32 | 64 | 256 | 1200 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Schur | 0.790 s | **0.639 s** | 0.938 s | 1.502 s | 7.433 s | 29.104 s |
+
+The default is 16. At 256 this path measures 6x *slower* than UMFPACK, so
+**anyone re-measuring it must sweep the block size before drawing a
+conclusion** -- a single bad block size inverts the result. Accelerate also does
+not parallelise an individual solve, and at large blocks concurrent solves
+serialise against each other; the win at block 16 comes from Julia-level
+threading over narrow blocks, exactly as the UMFPACK path does.
+
 ## Requirements
 
 - An M-series Mac running macOS 14 or newer.
@@ -241,6 +353,9 @@ Normal application use does not require these environment variables.
 | `BLAB_METAL_OPERATOR_STORAGE` | `shared` | Use `private` to allocate the operator matrices in private storage and copy them to the host, the pre-2026-09-02 behavior. |
 | `BLAB_METAL_PIPELINE` | `1` | Set to `0` to assemble and solve each sweep frequency sequentially instead of overlapping GPU assembly with the CPU factorization. |
 | `BLAB_METAL_ATOMIC_SCATTER` | `1` | Diagnostic for `pair_atomic` only: `0` skips the atomic scatter to time the pair arithmetic (the operators are then wrong). |
+| `BLAB_METAL_FEM_CONDENSATION` | `umfpack` | Interior solver for the coupled FEM condensation. `accelerate` is 1.87x faster and exceeds the 5e-4 gate; `accelerate_f64` is a wash. Falls back to `umfpack` when Accelerate's sparse library is absent. |
+| `BLAB_ACCELERATE_SCHUR_BLOCK` | `16` | Right-hand sides per `SparseSolve` call. Cost is superlinear in this, so a bad value inverts the measurement. |
+| `BLAB_COUPLED_STAGE_OVERLAP` | `auto` | `off` runs FEM condensation and BEM assembly in sequence instead of on separate threads. Needs more than one Julia thread. |
 | `BLAB_BEAT_FUSED_BM` | `1` | Set to `0` to assemble the four operators and combine them on the host for exterior solves. Coupled solves, `host_staged` assembly and the `host` singular mode always take the four-operator path. |
 
 The fused system is then solved by the adaptive dense solve described in
