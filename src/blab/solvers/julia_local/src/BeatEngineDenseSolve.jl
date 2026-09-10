@@ -100,14 +100,44 @@ const BEAT_DENSE_LU_GFLOPS_DEFAULT = 480.0
 # more per-call overhead on a small matrix. Keep OpenBLAS. The constant above
 # is an OpenBLAS number and switching the BLAS would invalidate it.
 #
-# The same table holds an idea worth keeping: rewriting the complex system as a
-# real 2N x 2N block system and factoring *that* on Accelerate costs 4.4985 s at
-# N = 10,000, against 5.5303 s for complex on OpenBLAS. Equivalent-real does
-# twice the arithmetic and Accelerate is more than twice as fast at it, so the
-# net is 1.23x, with a crossover near N = 9,000. That is a CPU-only version of
-# what the MPS device-solve proposal wanted, and it needs no GPU work. It is not
-# implemented; it would be a third route in `beat_dense_solve_plan` below, not a
-# parallel code path.
+# The obvious follow-on -- rewrite the complex system as a real 2N x 2N block
+# system so Accelerate's real path applies -- was measured and **loses**. Timing
+# only `lu!` makes it look like a 1.23x win; timing the whole solve does not.
+# Build + factorize + solve, M1 Pro, minimum of three:
+#
+#   N        complex/OpenBLAS   eqreal/Accelerate   eqreal/OpenBLAS
+#    5,000        0.692 s            1.146 s            1.296 s
+#    7,340        1.998 s            3.227 s            4.054 s
+#   10,230        5.417 s            6.584 s           10.900 s
+#
+# What the factorization-only comparison omitted is the triangular solve and the
+# 2N x 2N build (0.38 s at N = 10,230, and 2x the memory: 0.78 GB -> 1.56 GB).
+# Complex on OpenBLAS wins at every size tried. Note the last column: on one BLAS
+# the rewrite is a flat 2x loss, exactly as the doubled flop count predicts, so
+# it can only ever pay if the target is far faster on real than on complex.
+# Accelerate is faster on real, but not by enough.
+#
+# Two further reasons not to revisit it:
+#
+# 1. Switching BLAS is process-global, and Accelerate is much slower at the
+#    complex matrix-vector product GMRES runs once per iteration:
+#
+#      cgemv   N = 5,000    OpenBLAS 36.7 GB/s   Accelerate 14.3 GB/s
+#              N = 10,230   OpenBLAS 46.3 GB/s   Accelerate 14.5 GB/s
+#
+#    That is 2.6-3.2x slower on the route that exists for exactly the large
+#    problems this idea targets.
+#
+# 2. Accelerate is less accurate here. Against a ComplexF64 reference at
+#    N = 2,000, 4 drives:
+#
+#      complex        OpenBLAS 1.463e-07   Accelerate 1.245e-06
+#      eqreal         OpenBLAS 1.482e-07   Accelerate 1.377e-06
+#
+#    The rewrite itself is sound -- on OpenBLAS the two formulations agree to
+#    1.5e-07, which is what exact reordering should give. It is Accelerate that
+#    costs 8.5x accuracy, in both formulations. Against this project's 5e-4
+#    gates that is a real cost for a negative speed return.
 
 """Streaming cost of one dense complex matvec, seconds per matrix entry.
 
