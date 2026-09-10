@@ -196,6 +196,19 @@ a normal loudspeaker workload, not an edge case.
 
 ## Measured result for option B
 
+**Status (2026-09-10): built, measured, and removed.** The binding
+(`BeatEngineAccelerateSparse.jl`), the `BLAB_METAL_FEM_CONDENSATION` and
+`BLAB_ACCELERATE_SCHUR_BLOCK` controls, and the host condensation they hung off
+inside `build_coupled_system` are no longer in the tree; tag
+`archive/metal-host-condensation` is the last commit carrying them. Two things
+decided it. That condensation was never on the production Metal route, which
+goes through the CPU condensed solver in `BeatEngineCoupledCondensed.jl`. And
+re-measured on that route on `S218BP`, Accelerate in `ComplexF32` was 23% faster
+per frequency but 1.1e-2 to 4.0e-2 relative error against `beat_cpu` on
+diaphragm velocity, voice-coil current and probe pressures -- far past the 3.2e-3
+seen on `F2B_FLH` below and the 5e-4 gate -- where UMFPACK sits at 1.4e-5. The
+measurements below are kept as the record.
+
 Option B was built and measured. `BLAB_METAL_FEM_CONDENSATION` selects the
 interior solver on the Metal backend: `umfpack` (default), `accelerate`
 (`ComplexF32`), or `accelerate_f64` (`ComplexF64`). Median of six warm

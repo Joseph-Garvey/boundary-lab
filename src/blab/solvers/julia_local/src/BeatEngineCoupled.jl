@@ -3,12 +3,6 @@ module BeatEngineCoupled
 using LinearAlgebra, SparseArrays, StaticArrays
 using ..BeatEngineCore
 
-# Apple Accelerate sparse LU, used by the optional Metal condensation backend.
-# The binding is Apple-only and self-checks its struct layouts, so a mismatched
-# SDK degrades to "unavailable" rather than corrupting memory.
-include(joinpath(@__DIR__, "BeatEngineAccelerateSparse.jl"))
-using .BeatEngineAccelerateSparse
-
 const CUDSS_MODULE = try
     @eval import CUDSS
     CUDSS
@@ -1211,47 +1205,40 @@ function prepare_coupled_cache(
                 identity_p1_dp0,
                 T,
             )
-        elseif bem_backend == :rocm
+        else
             build_rocm_burton_miller_identity_cache(
                 identity_p1_p1,
                 identity_p1_dp0,
                 T,
             )
+        end
+        device_bem_flux = if bem_backend == :cuda
+            accelerator.CuArray(Complex{T}.(Matrix(interface_operators.bem_flux)))
         else
-            build_metal_burton_miller_identity_cache(
-                identity_p1_p1,
-                identity_p1_dp0,
-                T,
-            )
+            accelerator.ROCArray(Complex{T}.(Matrix(interface_operators.bem_flux)))
         end
-        device_array = bem_backend == :cuda ? accelerator.CuArray : accelerator.ROCArray
-        device_bem_flux = device_array(Complex{T}.(Matrix(interface_operators.bem_flux)))
-        # Metal always solves the coupled linear system on the host, so the
-        # sparse scatter caches that feed a device solve are not built for it.
-        if bem_backend in (:cuda, :rocm)
-            build_sparse_cache = bem_backend == :cuda ?
-                                 build_cuda_sparse_scatter_cache :
-                                 build_rocm_sparse_scatter_cache
-            gamma = Int.(collect(retained_fem_vertices))
-            device_sparse_blocks = (
-                stiffness=build_sparse_cache(stiffness),
-                mass=build_sparse_cache(mass),
-                bulk_loss_mass=build_sparse_cache(bulk_loss_mass),
-                wall_impedance=[
-                    build_sparse_cache(operator.matrix)
-                    for operator in wall_impedance_operators
-                ],
-                fem_load=build_sparse_cache(interface_operators.fem_load),
-                fem_trace=build_sparse_cache(interface_operators.fem_trace),
-                bem_trace=build_sparse_cache(interface_operators.bem_trace),
-                condensed_fem_load=build_sparse_cache(
-                    interface_operators.fem_load[gamma, :],
-                ),
-                condensed_fem_trace=build_sparse_cache(
-                    interface_operators.fem_trace[:, gamma],
-                ),
-            )
-        end
+        build_sparse_cache = bem_backend == :cuda ?
+                             build_cuda_sparse_scatter_cache :
+                             build_rocm_sparse_scatter_cache
+        gamma = Int.(collect(retained_fem_vertices))
+        device_sparse_blocks = (
+            stiffness=build_sparse_cache(stiffness),
+            mass=build_sparse_cache(mass),
+            bulk_loss_mass=build_sparse_cache(bulk_loss_mass),
+            wall_impedance=[
+                build_sparse_cache(operator.matrix)
+                for operator in wall_impedance_operators
+            ],
+            fem_load=build_sparse_cache(interface_operators.fem_load),
+            fem_trace=build_sparse_cache(interface_operators.fem_trace),
+            bem_trace=build_sparse_cache(interface_operators.bem_trace),
+            condensed_fem_load=build_sparse_cache(
+                interface_operators.fem_load[gamma, :],
+            ),
+            condensed_fem_trace=build_sparse_cache(
+                interface_operators.fem_trace[:, gamma],
+            ),
+        )
         accelerator.synchronize()
     end
     device_block_cache_s = (time_ns() - device_block_started) / 1.0e9
@@ -1717,8 +1704,7 @@ requires.
 So round the block *count* up to a whole multiple of the thread count and derive
 the size from that. The blocks get smaller than `requested` rather than larger,
 which is the safe direction: block width sets the dense right-hand-side buffer
-each task allocates, and narrower blocks were also what the Accelerate path
-measured fastest.
+each task allocates.
 """
 function _resolved_schur_block_size(requested::Int, retained_count::Int)
     retained_count == 0 && return 0
@@ -1902,412 +1888,6 @@ function _release_rocm_hybrid_fem_condensation!(condensation)
     return nothing
 end
 
-# Host condensation. The partition, the interior UMFPACK factorization, and the
-# blocked Schur complement are the same CPU work the ROCm hybrid path already
-# does; this variant keeps the reduced Schur block on the host instead of
-# uploading it, for backends whose linear solve runs on the host. On Apple
-# Silicon that is the whole story: unified memory means there is no transfer to
-# avoid, and the platform LAPACK ComplexF32 factorization beats the device
-# alternative anyway.
-function _build_host_fem_condensation(
-    fem_system::SparseMatrixCSC{Complex{T}},
-    interface_operators::InterfaceOperators{T},
-    retained_vertices,
-) where {T<:AbstractFloat}
-    fem_count = size(fem_system, 1)
-    retained_vertices = Int.(collect(retained_vertices))
-    retained_set = Set(retained_vertices)
-    interior_vertices = [vertex for vertex in 1:fem_count if !(vertex in retained_set)]
-    interior_load = interface_operators.fem_load[interior_vertices, :]
-    nnz(interior_load) == 0 || error(
-        "FEM static condensation requires interface loads to have support only on retained nodes.",
-    )
-
-    partition_started = time_ns()
-    interior_system = SparseMatrixCSC{ComplexF64,Int}(
-        fem_system[interior_vertices, interior_vertices],
-    )
-    interior_to_retained = SparseMatrixCSC{ComplexF64,Int}(
-        fem_system[interior_vertices, retained_vertices],
-    )
-    retained_to_interior = SparseMatrixCSC{ComplexF64,Int}(
-        fem_system[retained_vertices, interior_vertices],
-    )
-    retained_system = Matrix{ComplexF64}(fem_system[retained_vertices, retained_vertices])
-    partition_s = (time_ns() - partition_started) / 1.0e9
-
-    factorization = nothing
-    factorization_started = time_ns()
-    if !isempty(interior_vertices)
-        factorization = lu(interior_system)
-    end
-    factorization_s = (time_ns() - factorization_started) / 1.0e9
-
-    schur_started = time_ns()
-    schur_result = if isempty(interior_vertices)
-        (
-            schur=retained_system,
-            block_size=0,
-            thread_count=1,
-            densify_s=0.0,
-            solve_s=0.0,
-            apply_s=0.0,
-        )
-    else
-        _blocked_umfpack_schur_complement(
-            factorization,
-            interior_to_retained,
-            retained_to_interior,
-            retained_system,
-        )
-    end
-    schur_extraction_s = (time_ns() - schur_started) / 1.0e9
-
-    return (
-        backend=:cpu_hybrid,
-        factorization=factorization,
-        schur=Complex{T}.(schur_result.schur),
-        interior_vertices=interior_vertices,
-        retained_vertices=retained_vertices,
-        interior_to_retained=interior_to_retained,
-        retained_to_interior=retained_to_interior,
-        interior_count=length(interior_vertices),
-        retained_count=length(retained_vertices),
-        schur_block_size=schur_result.block_size,
-        schur_thread_count=schur_result.thread_count,
-        timings=(
-            analysis_s=0.0,
-            partition_s=partition_s,
-            factorization_s=factorization_s,
-            schur_extraction_s=schur_extraction_s,
-            schur_densify_s=schur_result.densify_s,
-            schur_solve_s=schur_result.solve_s,
-            schur_apply_s=schur_result.apply_s,
-            upload_s=0.0,
-        ),
-    )
-end
-
-function _release_host_fem_condensation!(condensation)
-    isnothing(condensation) && return nothing
-    isnothing(condensation.factorization) || finalize(condensation.factorization)
-    return nothing
-end
-
-# Accelerate condensation. Structurally the same as the host path — the same
-# partition, the same Schur complement, the reduced block kept on the host — but
-# the interior factorization and its triangular solves go through Apple's sparse
-# LU in ComplexF32 instead of UMFPACK in ComplexF64.
-#
-# Two things make this worth a separate path rather than a swap. Accelerate takes
-# the whole right-hand-side block in one `SparseSolve` call, so the Schur
-# complement stops chunking into 64-column blocks across Julia tasks and hands
-# the entire interface block over at once. And ComplexF32 matches the precision
-# the rest of the FP32 pipeline already works in, halving the traffic that the
-# UMFPACK path spends promoting to ComplexF64 and casting back.
-#
-# The precision change is the risk: a poorly conditioned FEM interior has less
-# headroom in single precision. `BLAB_METAL_FEM_CONDENSATION=umfpack` returns to
-# the host path.
-# SparseSolve cost grows superlinearly in the number of right-hand sides per
-# call, so the Schur complement feeds it narrow blocks and parallelises across
-# them. Measured on the F2B_FLH interior (21,329 unknowns, 1,102 interface
-# columns), Schur wall time by block size: 8 -> 0.790 s, 16 -> 0.639 s,
-# 32 -> 0.938 s, 64 -> 1.502 s, 256 -> 7.433 s, 1200 -> 29.104 s. Re-measure with
-# BLAB_ACCELERATE_SCHUR_BLOCK before changing this.
-const ACCELERATE_SCHUR_BLOCK_SIZE = 16
-
-# Right-hand-side columns handed to one SparseSolve call. Exposed so the block
-# size can be swept without a rebuild when re-measuring this path.
-function _accelerate_schur_block_size()
-    configured = strip(get(ENV, "BLAB_ACCELERATE_SCHUR_BLOCK", ""))
-    isempty(configured) && return ACCELERATE_SCHUR_BLOCK_SIZE
-    value = tryparse(Int, configured)
-    (isnothing(value) || value <= 0) &&
-        error("BLAB_ACCELERATE_SCHUR_BLOCK must be a positive integer.")
-    return value
-end
-
-function _blocked_accelerate_schur_complement(
-    factorization::AccelerateSparseLU{C},
-    interior_to_retained::SparseMatrixCSC{C,Int},
-    retained_to_interior::SparseMatrixCSC{C,Int},
-    retained_system::Matrix{C};
-    block_size::Int=_accelerate_schur_block_size(),
-) where {C}
-    block_size > 0 || throw(ArgumentError("Schur-complement block size must be positive."))
-    retained_count = size(interior_to_retained, 2)
-    retained_count == 0 && return (
-        schur=copy(retained_system),
-        block_size=0,
-        thread_count=1,
-        densify_s=0.0,
-        solve_s=0.0,
-        apply_s=0.0,
-    )
-
-    schur = copy(retained_system)
-    interior_count = size(interior_to_retained, 1)
-    resolved_block_size = min(block_size, retained_count)
-
-    # The block loop is parallelised the same way the UMFPACK path is. Each task
-    # takes its own copy of the factorization struct and its own workspace,
-    # mirroring the by-value `SparseSolve` signature in the C header; the numeric
-    # factorization itself is only read. Threading only pays at small block sizes
-    # — at 256 columns per call the solves serialise and it gains nothing.
-    block_starts = collect(1:resolved_block_size:retained_count)
-    thread_count = max(1, min(Threads.nthreads(), length(block_starts)))
-    densify_ns = Threads.Atomic{UInt64}(0)
-    solve_ns = Threads.Atomic{UInt64}(0)
-    apply_ns = Threads.Atomic{UInt64}(0)
-    tasks = map(1:thread_count) do task_index
-        Threads.@spawn begin
-            dense_columns = Matrix{C}(undef, interior_count, resolved_block_size)
-            solved_columns = Matrix{C}(undef, interior_count, resolved_block_size)
-            local_densify = UInt64(0)
-            local_solve = UInt64(0)
-            local_apply = UInt64(0)
-            for block_index in task_index:thread_count:length(block_starts)
-                block_start = block_starts[block_index]
-                columns = block_start:min(
-                    block_start + resolved_block_size - 1,
-                    retained_count,
-                )
-                block_rhs = view(dense_columns, :, 1:length(columns))
-                block_solution = view(solved_columns, :, 1:length(columns))
-                mark = time_ns()
-                _densify_sparse_columns!(block_rhs, interior_to_retained, columns)
-                local_densify += time_ns() - mark
-                mark = time_ns()
-                accelerate_sparse_solve!(block_solution, factorization, block_rhs)
-                local_solve += time_ns() - mark
-                mark = time_ns()
-                mul!(
-                    view(schur, :, columns),
-                    retained_to_interior,
-                    block_solution,
-                    -one(C),
-                    one(C),
-                )
-                local_apply += time_ns() - mark
-            end
-            Threads.atomic_add!(densify_ns, local_densify)
-            Threads.atomic_add!(solve_ns, local_solve)
-            Threads.atomic_add!(apply_ns, local_apply)
-        end
-    end
-    foreach(wait, tasks)
-    return (
-        schur=schur,
-        block_size=resolved_block_size,
-        thread_count=thread_count,
-        densify_s=densify_ns[] / 1.0e9,
-        solve_s=solve_ns[] / 1.0e9,
-        apply_s=apply_ns[] / 1.0e9,
-    )
-end
-
-function _build_accelerate_fem_condensation(
-    fem_system::SparseMatrixCSC{Complex{T}},
-    interface_operators::InterfaceOperators{T},
-    retained_vertices;
-    element_type::Type{C}=ComplexF32,
-) where {T<:AbstractFloat,C<:Union{ComplexF32,ComplexF64}}
-    accelerate_sparse_available() ||
-        error("Accelerate sparse LU is unavailable on this machine.")
-    fem_count = size(fem_system, 1)
-    retained_vertices = Int.(collect(retained_vertices))
-    retained_set = Set(retained_vertices)
-    interior_vertices = [vertex for vertex in 1:fem_count if !(vertex in retained_set)]
-    interior_load = interface_operators.fem_load[interior_vertices, :]
-    nnz(interior_load) == 0 || error(
-        "FEM static condensation requires interface loads to have support only on retained nodes.",
-    )
-
-    partition_started = time_ns()
-    interior_system = SparseMatrixCSC{C,Int}(
-        fem_system[interior_vertices, interior_vertices],
-    )
-    interior_to_retained = SparseMatrixCSC{C,Int}(
-        fem_system[interior_vertices, retained_vertices],
-    )
-    retained_to_interior = SparseMatrixCSC{C,Int}(
-        fem_system[retained_vertices, interior_vertices],
-    )
-    retained_system = Matrix{C}(fem_system[retained_vertices, retained_vertices])
-    partition_s = (time_ns() - partition_started) / 1.0e9
-
-    factorization = nothing
-    factorization_started = time_ns()
-    if !isempty(interior_vertices)
-        factorization = accelerate_sparse_lu(interior_system)
-    end
-    factorization_s = (time_ns() - factorization_started) / 1.0e9
-
-    schur_started = time_ns()
-    schur_result = if isempty(interior_vertices)
-        (
-            schur=retained_system,
-            block_size=0,
-            thread_count=1,
-            densify_s=0.0,
-            solve_s=0.0,
-            apply_s=0.0,
-        )
-    else
-        _blocked_accelerate_schur_complement(
-            factorization,
-            interior_to_retained,
-            retained_to_interior,
-            retained_system,
-        )
-    end
-    schur_extraction_s = (time_ns() - schur_started) / 1.0e9
-
-    return (
-        backend=:accelerate,
-        factorization=factorization,
-        schur=Complex{T}.(schur_result.schur),
-        interior_vertices=interior_vertices,
-        retained_vertices=retained_vertices,
-        interior_to_retained=interior_to_retained,
-        retained_to_interior=retained_to_interior,
-        interior_count=length(interior_vertices),
-        retained_count=length(retained_vertices),
-        schur_block_size=schur_result.block_size,
-        schur_thread_count=schur_result.thread_count,
-        timings=(
-            analysis_s=0.0,
-            partition_s=partition_s,
-            factorization_s=factorization_s,
-            schur_extraction_s=schur_extraction_s,
-            schur_densify_s=schur_result.densify_s,
-            schur_solve_s=schur_result.solve_s,
-            schur_apply_s=schur_result.apply_s,
-            upload_s=0.0,
-        ),
-    )
-end
-
-function _release_accelerate_fem_condensation!(condensation)
-    isnothing(condensation) && return nothing
-    isnothing(condensation.factorization) || accelerate_sparse_free!(condensation.factorization)
-    return nothing
-end
-
-"""
-    _condensation_interior_solve(condensation, rhs)
-
-Apply the interior factorization to a dense right-hand-side block, whichever
-solver built it. UMFPACK works in ComplexF64 and Accelerate in ComplexF32, so
-this converts on the way in and back out and returns ComplexF64 either way,
-which is what the reduction and reconstruction callers expect.
-"""
-function _condensation_interior_solve(condensation, rhs::AbstractMatrix)
-    if condensation.backend === :accelerate
-        element = eltype(condensation.factorization)
-        block = element.(rhs)
-        solution = similar(block)
-        accelerate_sparse_solve!(solution, condensation.factorization, block)
-        return ComplexF64.(solution)
-    end
-    return condensation.factorization \ ComplexF64.(rhs)
-end
-
-"""
-    _metal_fem_condensation_backend() -> Symbol
-
-`BLAB_METAL_FEM_CONDENSATION` selects the interior solver for the Metal backend:
-`umfpack` (default) or `accelerate`. Falls back to `umfpack` whenever Accelerate
-is unavailable, so the variable is safe to set unconditionally.
-"""
-function _metal_fem_condensation_backend()
-    requested = lowercase(strip(get(ENV, "BLAB_METAL_FEM_CONDENSATION", "umfpack")))
-    requested in ("umfpack", "accelerate", "accelerate_f64") || error(
-        "Unsupported BLAB_METAL_FEM_CONDENSATION value: $requested. " *
-        "Expected umfpack, accelerate, or accelerate_f64.",
-    )
-    accelerate_sparse_available() || return :umfpack
-    requested == "accelerate" && return :accelerate
-    requested == "accelerate_f64" && return :accelerate_f64
-    return :umfpack
-end
-
-"""
-    _build_fem_condensation(bem_backend, fem_system, interface_operators, retained_fem_vertices)
-
-Dispatch the FEM static condensation to the interior solver this backend uses.
-Split out of `build_coupled_system` so the stage can also be started as a task —
-see `_coupled_stage_overlap_enabled`.
-"""
-function _build_fem_condensation(
-    bem_backend::Symbol,
-    fem_system,
-    interface_operators,
-    retained_fem_vertices,
-)
-    if bem_backend == :cuda
-        return _build_cuda_fem_condensation(
-            fem_system,
-            interface_operators,
-            retained_fem_vertices,
-        )
-    elseif bem_backend == :rocm
-        return _build_rocm_hybrid_fem_condensation(
-            fem_system,
-            interface_operators,
-            retained_fem_vertices,
-        )
-    elseif bem_backend == :metal &&
-           _metal_fem_condensation_backend() in (:accelerate, :accelerate_f64)
-        return _build_accelerate_fem_condensation(
-            fem_system,
-            interface_operators,
-            retained_fem_vertices;
-            element_type=_metal_fem_condensation_backend() === :accelerate_f64 ?
-                         ComplexF64 : ComplexF32,
-        )
-    end
-    return _build_host_fem_condensation(
-        fem_system,
-        interface_operators,
-        retained_fem_vertices,
-    )
-end
-
-"""
-    _coupled_stage_overlap_enabled(bem_backend) -> Bool
-
-Whether to run the FEM static condensation concurrently with BEM operator
-assembly.
-
-The two stages are independent: the condensation reads only `fem_system`,
-`interface_operators` and the retained vertex list, none of which the BEM
-assembly touches. Running them in sequence therefore leaves one processor idle
-for the other's duration.
-
-That idling only costs anything when the two stages use *different* processors.
-On an accelerator backend the BEM assembly is on the device while the
-condensation is host UMFPACK or Accelerate, so overlapping them hides the
-shorter stage entirely. On `:cpu` both are host code competing for the same
-cores — the condensation already saturates them through
-`_blocked_umfpack_schur_complement` — so overlapping there buys nothing and only
-adds scheduling noise. Hence: accelerators on, CPU off.
-
-`BLAB_COUPLED_STAGE_OVERLAP` overrides the default: `on`, `off`, or `auto`.
-"""
-function _coupled_stage_overlap_enabled(bem_backend::Symbol)
-    requested = lowercase(strip(get(ENV, "BLAB_COUPLED_STAGE_OVERLAP", "auto")))
-    requested in ("auto", "on", "off") || error(
-        "Unsupported BLAB_COUPLED_STAGE_OVERLAP value: $requested. Expected auto, on, or off.",
-    )
-    requested == "off" && return false
-    # A spawned condensation needs a thread of its own to overlap with anything.
-    Threads.nthreads() > 1 || return false
-    requested == "on" && return true
-    return bem_backend in (:cuda, :rocm, :metal)
-end
-
 function build_coupled_system(
     fem_mesh::VolumeMesh{T},
     bem_mesh::BoundaryMesh{T},
@@ -2329,8 +1909,8 @@ function build_coupled_system(
     transducer_operators=nothing,
     prescribed_bem_normal_velocity=nothing,
 ) where {T<:AbstractFloat}
-    static_condensation && !(bem_backend in (:cuda, :rocm, :metal)) && error(
-        "FEM static condensation is currently available only for CUDA, ROCm, and Metal coupled backends.",
+    static_condensation && !(bem_backend in (:cuda, :rocm)) && error(
+        "FEM static condensation is currently available only for CUDA and ROCm coupled backends.",
     )
     static_condensation && validation_diagnostics && error(
         "FEM static condensation cannot be combined with full-matrix validation diagnostics.",
@@ -2415,21 +1995,6 @@ function build_coupled_system(
     prescribed_bem_count = size(bem_prescribed_neumann, 2)
     fem_system_s = (time_ns() - fem_stage_started) / 1.0e9
 
-    # Everything the condensation reads is final at this point, and nothing below
-    # writes to it, so on an accelerator backend it runs on the host while the BEM
-    # operators assemble on the device. Started here rather than at its own stage
-    # marker below because the overlap is the whole point.
-    stage_overlap = static_condensation && _coupled_stage_overlap_enabled(bem_backend)
-    condensation_started = time_ns()
-    condensation_task = stage_overlap ? Threads.@spawn(
-        _build_fem_condensation(
-            bem_backend,
-            fem_system,
-            interface_operators,
-            retained_fem_vertices,
-        )
-    ) : nothing
-
     bem_operator_started = time_ns()
     operators = assemble_regular_galerkin_operators(
         bem_mesh,
@@ -2457,11 +2022,6 @@ function build_coupled_system(
     end
     bem_operator_s = (time_ns() - bem_operator_started) / 1.0e9
     bem_matrix_started = time_ns()
-    # Metal resolves the coupled linear system on the host because that is the
-    # faster arrangement on unified memory, not because the data cannot reach the
-    # device: the platform LAPACK ComplexF32 factorization beats the MPS
-    # equivalent-real path by 5.7x. Metal still assembles the BEM operators and
-    # blocks on device.
     linear_backend = bem_backend in (:cuda, :rocm) && !validation_diagnostics ?
                      bem_backend : :cpu
     bem_blocks = if bem_backend in (:cuda, :rocm)
@@ -2528,34 +2088,21 @@ function build_coupled_system(
                          Complex{T}.(Array(bem_blocks.bem_prescribed_rhs))
     bem_matrix_s = (time_ns() - bem_matrix_started) / 1.0e9
 
-    # When the stage was overlapped, `condensation_started` was marked before the
-    # BEM assembly, so `fem_condensation_s` spans the concurrent region and no
-    # longer sums with `bem_operator_s` into the wall time. `stage_overlap` in the
-    # timings says which reading applies.
-    if !static_condensation
-        condensation_started = time_ns()
-    elseif isnothing(condensation_task)
-        condensation_started = time_ns()
-    end
+    condensation_started = time_ns()
     condensation = if !static_condensation
         nothing
-    elseif isnothing(condensation_task)
-        _build_fem_condensation(
-            bem_backend,
+    elseif bem_backend == :cuda
+        _build_cuda_fem_condensation(
             fem_system,
             interface_operators,
             retained_fem_vertices,
         )
     else
-        # `fetch` wraps a task failure in a TaskFailedException, which would change
-        # the error every caller of this function sees depending only on whether the
-        # stage happened to be overlapped. Rethrow the original instead.
-        try
-            fetch(condensation_task)
-        catch exception
-            exception isa TaskFailedException || rethrow()
-            rethrow(exception.task.result)
-        end
+        _build_rocm_hybrid_fem_condensation(
+            fem_system,
+            interface_operators,
+            retained_fem_vertices,
+        )
     end
     fem_condensation_s = (time_ns() - condensation_started) / 1.0e9
 
@@ -2737,36 +2284,24 @@ function build_coupled_system(
         d_coupled
     else
         host_coupled = zeros(Complex{T}, system_count, system_count)
-        if static_condensation
-            host_coupled[gamma_range, gamma_range] = condensation.schur
-            host_coupled[gamma_range, flux_range] = -Complex{T}.(
-                Matrix(interface_operators.fem_load[retained_fem_vertices, :])
-            )
-            host_coupled[flux_range, gamma_range] = Complex{T}.(
-                Matrix(interface_operators.fem_trace[:, retained_fem_vertices])
-            )
-        else
-            host_coupled[fem_range, fem_range] = Matrix(fem_system)
-            host_coupled[fem_range, flux_range] =
-                -Complex{T}.(Matrix(interface_operators.fem_load))
-            host_coupled[flux_range, fem_range] =
-                Complex{T}.(Matrix(interface_operators.fem_trace))
-        end
+        host_coupled[fem_range, fem_range] = Matrix(fem_system)
+        host_coupled[fem_range, flux_range] =
+            -Complex{T}.(Matrix(interface_operators.fem_load))
         host_coupled[bem_range, bem_range] = bem_lhs
         host_coupled[bem_range, flux_range] = bem_blocks.bem_interface_block
+        host_coupled[flux_range, fem_range] =
+            Complex{T}.(Matrix(interface_operators.fem_trace))
         host_coupled[flux_range, bem_range] =
             -Complex{T}.(Matrix(interface_operators.bem_trace))
         if transducer_count > 0
-            host_coupled[coupled_fem_range, mechanical_range] =
+            host_coupled[fem_range, mechanical_range] =
                 -normal_derivative_scale .* Complex{T}.(
-                    Matrix(resolved_transducer_operators.fem_surface[coupled_fem_vertices, :])
+                    Matrix(resolved_transducer_operators.fem_surface)
                 )
             host_coupled[bem_range, mechanical_range] = bem_blocks.bem_motion_block
-            host_coupled[mechanical_range, coupled_fem_range] =
+            host_coupled[mechanical_range, fem_range] =
                 -Complex{T}.(
-                    transpose(
-                        Matrix(resolved_transducer_operators.fem_force[coupled_fem_vertices, :]),
-                    )
+                    transpose(Matrix(resolved_transducer_operators.fem_force))
                 )
             host_coupled[mechanical_range, bem_range] =
                 Complex{T}.(
@@ -2844,9 +2379,6 @@ function build_coupled_system(
             bem_operator_s=bem_operator_s,
             bem_matrix_s=bem_matrix_s,
             fem_condensation_s=fem_condensation_s,
-            # True when `fem_condensation_s` and `bem_operator_s` cover the same
-            # wall-clock span and must not be added together.
-            stage_overlap=stage_overlap,
             block_assembly_s=block_assembly_s,
             coupled_factorization_s=coupled_factorization_s,
             replay_factorization_s=replay_factorization_s,
@@ -2865,12 +2397,6 @@ function release_coupled_system!(system)
         _release_cuda_fem_condensation!(system.condensation)
     elseif system.linear_backend == :rocm && system.formulation == :fem_interface_condensed
         _release_rocm_hybrid_fem_condensation!(system.condensation)
-    elseif system.formulation == :fem_interface_condensed &&
-           system.condensation.backend == :cpu_hybrid
-        _release_host_fem_condensation!(system.condensation)
-    elseif system.formulation == :fem_interface_condensed &&
-           system.condensation.backend == :accelerate
-        _release_accelerate_fem_condensation!(system.condensation)
     end
     system.owns_cache && release_coupled_cache!(system.cache)
     return nothing
@@ -3055,74 +2581,6 @@ function _solve_rocm_hybrid_condensed_excitations(
     ]
 end
 
-# Condensed solve for a host linear backend. Identical to the ROCm hybrid path
-# except that the reduced system is solved with the host factorization instead of
-# being staged to the device; the RHS reduction and the interior reconstruction
-# were already host work there.
-function _solve_host_condensed_excitations(
-    system,
-    fem_rhs,
-    bem_rhs,
-    electrical_rhs,
-    prescribed_bem_neumann,
-)
-    T = system.scalar_type
-    condensation = system.condensation
-    excitation_count = size(fem_rhs, 2)
-
-    rhs_condensation_started = time_ns()
-    reduced_fem_rhs = if condensation.interior_count == 0
-        Complex{T}.(fem_rhs[condensation.retained_vertices, :])
-    else
-        interior_rhs = ComplexF64.(fem_rhs[condensation.interior_vertices, :])
-        interior_forward = _condensation_interior_solve(condensation, interior_rhs)
-        Complex{T}.(
-            fem_rhs[condensation.retained_vertices, :] .-
-            ComplexF64.(condensation.retained_to_interior) * interior_forward
-        )
-    end
-    host_rhs = zeros(Complex{T}, size(system.factorization, 1), excitation_count)
-    host_rhs[system.gamma_range, :] = reduced_fem_rhs
-    host_rhs[system.bem_range, :] = bem_rhs
-    host_rhs[system.electrical_range, :] = electrical_rhs
-    fem_rhs_condensation_s = (time_ns() - rhs_condensation_started) / 1.0e9
-
-    host_solution = system.factorization \ host_rhs
-
-    reconstruction_started = time_ns()
-    retained_pressure = view(host_solution, system.gamma_range, :)
-    fem_pressure = zeros(Complex{T}, length(system.fem_mesh.vertices), excitation_count)
-    fem_pressure[condensation.retained_vertices, :] .= retained_pressure
-    if condensation.interior_count > 0
-        interior_rhs = (
-            ComplexF64.(fem_rhs[condensation.interior_vertices, :]) .-
-            ComplexF64.(condensation.interior_to_retained) * ComplexF64.(retained_pressure)
-        )
-        fem_pressure[condensation.interior_vertices, :] .= Complex{T}.(
-            _condensation_interior_solve(condensation, interior_rhs)
-        )
-    end
-    fem_reconstruction_s = (time_ns() - reconstruction_started) / 1.0e9
-    bem_pressure = view(host_solution, system.bem_range, :)
-    interface_flux = view(host_solution, system.flux_range, :)
-    diaphragm_velocity = view(host_solution, system.mechanical_range, :)
-    voice_coil_current = view(host_solution, system.electrical_range, :)
-    return [
-        _coupled_solution_from_parts(
-            system,
-            fem_pressure[:, column],
-            bem_pressure[:, column],
-            interface_flux[:, column];
-            diaphragm_velocity=diaphragm_velocity[:, column],
-            voice_coil_current=voice_coil_current[:, column],
-            prescribed_bem_neumann=prescribed_bem_neumann[:, column],
-            fem_rhs_condensation_s=fem_rhs_condensation_s,
-            fem_reconstruction_s=fem_reconstruction_s,
-        )
-        for column in axes(fem_pressure, 2)
-    ]
-end
-
 function solve_coupled_excitations(system, excitations)
     T = system.scalar_type
     requested = collect(excitations)
@@ -3201,15 +2659,6 @@ function solve_coupled_excitations(system, excitations)
     end
     if system.formulation == :fem_interface_condensed && system.linear_backend == :rocm
         return _solve_rocm_hybrid_condensed_excitations(
-            system,
-            fem_rhs,
-            bem_rhs,
-            electrical_rhs,
-            prescribed_bem_neumann,
-        )
-    elseif system.formulation == :fem_interface_condensed &&
-           system.condensation.backend in (:cpu_hybrid, :accelerate)
-        return _solve_host_condensed_excitations(
             system,
             fem_rhs,
             bem_rhs,

@@ -1,4 +1,5 @@
-include(joinpath(@__DIR__, "..", "src", "BeatEngineCoupledCondensed.jl"))
+isdefined(@__MODULE__, :BeatEngineCoupledCondensed) ||
+    include(joinpath(@__DIR__, "..", "src", "BeatEngineCoupledCondensed.jl"))
 using .BeatEngineCoupled
 using .BeatEngineCoupledCondensed
 using LinearAlgebra, Random, SparseArrays, StaticArrays

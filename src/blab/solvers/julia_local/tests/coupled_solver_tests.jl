@@ -1,5 +1,11 @@
 include(joinpath(@__DIR__, "..", "src", "BeatEngineCoupled.jl"))
 using .BeatEngineCoupled
+# The Metal gate below exercises the production condensing route, which is the
+# condensed solver. coupled_condensed_tests.jl loads the same module later and
+# guards against loading it twice.
+isdefined(@__MODULE__, :BeatEngineCoupledCondensed) ||
+    include(joinpath(@__DIR__, "..", "src", "BeatEngineCoupledCondensed.jl"))
+using .BeatEngineCoupledCondensed
 using LinearAlgebra, SparseArrays, StaticArrays
 
 const COUPLED_FIXTURE_ROOT = normpath(joinpath(@__DIR__, "..", "..", "..", "..", "..", "tests", "fixtures"))
@@ -1160,7 +1166,25 @@ if get(ENV, "BLAB_RUN_COUPLED_METAL", "0") == "1" && metal_available()
             bem_backend=:metal,
             static_condensation=false,
         )
-        condensed_system = build_coupled_system(
+        # The production route for a condensing Metal solve: the CPU condensed
+        # solver with its BEM operators assembled on the GPU. The cache carries
+        # the backend and the retained vertex set, built the way the driver does.
+        condensed_transducer_operators = assemble_transducer_operators(fem_mesh, bem_mesh, [transducer])
+        condensed_retained_vertices = sort(unique(vcat(
+            interface_map.fem_vertex_indices,
+            unique(findnz(condensed_transducer_operators.fem_surface)[1]),
+        )))
+        metal_condensed_cache = prepare_condensed_coupled_cache(
+            fem_mesh,
+            bem_mesh,
+            interface_map;
+            quadrature_order=COUPLED_QUADRATURE_ORDER,
+            singular_order=COUPLED_SINGULAR_ORDER,
+            retained_fem_vertices=condensed_retained_vertices,
+            bulk_loss_factor_by_vertex=fill(0.01f0, length(fem_mesh.vertices)),
+            bem_backend=:metal,
+        )
+        build_metal_condensed() = build_condensed_coupled_system(
             fem_mesh,
             bem_mesh,
             interface_map,
@@ -1168,9 +1192,10 @@ if get(ENV, "BLAB_RUN_COUPLED_METAL", "0") == "1" && metal_available()
             Float32(343),
             Float32(1.21);
             common_options...,
-            bem_backend=:metal,
-            static_condensation=true,
+            cache=metal_condensed_cache,
+            transducer_operators=condensed_transducer_operators,
         )
+        condensed_system = build_metal_condensed()
         try
             cpu_solution = solve_coupled_system(cpu_system, radiator_tag)
             metal_solutions = solve_coupled_systems(
@@ -1179,7 +1204,7 @@ if get(ENV, "BLAB_RUN_COUPLED_METAL", "0") == "1" && metal_available()
                 radiator_velocities=ComplexF32[1, 0.5],
             )
             metal_solution = metal_solutions[1]
-            condensed_solutions = solve_coupled_systems(
+            condensed_solutions = solve_condensed_coupled_systems(
                 condensed_system,
                 [radiator_tag, radiator_tag];
                 radiator_velocities=ComplexF32[1, 0.5],
@@ -1196,7 +1221,7 @@ if get(ENV, "BLAB_RUN_COUPLED_METAL", "0") == "1" && metal_available()
             cpu_bem_solution = only(solve_coupled_excitations(cpu_system, [bem_excitation]))
             metal_bem_solution = only(solve_coupled_excitations(metal_system, [bem_excitation]))
             condensed_bem_solution = only(
-                solve_coupled_excitations(condensed_system, [bem_excitation]),
+                solve_condensed_coupled_excitations(condensed_system, [bem_excitation]),
             )
             voltage_excitation = (
                 kind=:voltage,
@@ -1213,7 +1238,7 @@ if get(ENV, "BLAB_RUN_COUPLED_METAL", "0") == "1" && metal_available()
                 solve_coupled_excitations(metal_system, [voltage_excitation]),
             )
             condensed_voltage_solution = only(
-                solve_coupled_excitations(condensed_system, [voltage_excitation]),
+                solve_condensed_coupled_excitations(condensed_system, [voltage_excitation]),
             )
             relative_error(reference, candidate) = norm(candidate - reference) / norm(reference)
 
@@ -1221,8 +1246,9 @@ if get(ENV, "BLAB_RUN_COUPLED_METAL", "0") == "1" && metal_available()
             @test metal_system.linear_backend == :cpu
             @test metal_system.formulation == :monolithic
             @test condensed_system.linear_backend == :cpu
+            @test condensed_system.bem_backend == :metal
             @test condensed_system.formulation == :fem_interface_condensed
-            @test condensed_system.condensation.backend == :cpu_hybrid
+            @test condensed_system.condensation.backend == :cpu_umfpack
             @test condensed_system.solved_system_order < condensed_system.full_system_order
             @test condensed_system.condensation.schur_block_size > 0
             @test 1 <= condensed_system.condensation.schur_thread_count <= Threads.nthreads()
@@ -1358,7 +1384,8 @@ if get(ENV, "BLAB_RUN_COUPLED_METAL", "0") == "1" && metal_available()
         finally
             release_coupled_system!(cpu_system)
             release_coupled_system!(metal_system)
-            release_coupled_system!(condensed_system)
+            release_condensed_coupled_system!(condensed_system)
+            release_condensed_coupled_cache!(metal_condensed_cache)
         end
     end
 elseif get(ENV, "BLAB_RUN_COUPLED_METAL", "0") == "1"

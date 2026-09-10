@@ -124,12 +124,25 @@ def test_metal_coupled_backend_constructs_and_uses_the_metal_julia_project() -> 
     assert Path(backend.julia_project) == DEFAULT_BEAT_ENGINE_METAL_PROJECT
 
 
-def test_metal_condensation_runs_on_the_host() -> None:
+def test_metal_condenses_through_the_cpu_condensed_solver() -> None:
+    # Metal has no GPU LU, so the driver sends a condensing Metal solve to the
+    # CPU condensed solver with its BEM operators assembled on the GPU -- the
+    # same route as beat_cpu, not a Metal-specific condensation. The earlier
+    # host/Accelerate condensation inside build_coupled_system was never on
+    # this route and is gone (tag archive/metal-host-condensation keeps it).
+    driver = (REPO_ROOT / "src/blab/solvers/julia_local/coupled_solver.jl").read_text(encoding="utf-8")
+    assert "use_condensed_solver = static_condensation && bem_backend in (:cpu, :metal)" in driver
+
+    condensed = (REPO_ROOT / "src/blab/solvers/julia_local/src/BeatEngineCoupledCondensed.jl").read_text(
+        encoding="utf-8"
+    )
+    assert "bem_backend in (:cpu, :metal)" in condensed
+
     coupled = (REPO_ROOT / "src/blab/solvers/julia_local/src/BeatEngineCoupled.jl").read_text(encoding="utf-8")
-    assert "_build_host_fem_condensation" in coupled
-    assert "_solve_host_condensed_excitations" in coupled
-    assert ":cpu_hybrid" in coupled
-    assert "static_condensation && !(bem_backend in (:cuda, :rocm, :metal))" in coupled
+    assert "static_condensation && !(bem_backend in (:cuda, :rocm))" in coupled
+    assert "_build_host_fem_condensation" not in coupled
+    assert "BeatEngineAccelerateSparse" not in coupled
+    assert not (REPO_ROOT / "src/blab/solvers/julia_local/src/BeatEngineAccelerateSparse.jl").exists()
 
 
 def test_solver_jl_dispatches_the_metal_backend() -> None:
@@ -195,59 +208,30 @@ def test_backend_label_lookup_reports_metal() -> None:
     assert label == "BEAT Engine (Apple Metal)"
 
 
-def _accelerate_source() -> str:
-    return (REPO_ROOT / "src/blab/solvers/julia_local/src/BeatEngineAccelerateSparse.jl").read_text(encoding="utf-8")
-
-
-def test_accelerate_binding_asserts_its_struct_layouts() -> None:
-    source = _accelerate_source()
-    # A ccall layout mistake is silent corruption, so the binding must check the
-    # ABI it was written against rather than trusting the SDK to be unchanged.
-    assert "accelerate_sparse_abi_matches_reference" in source
-    assert "sizeof(type) == size" in source
-    assert "fieldoffset(type, index) == offset" in source
-    assert "accelerate_sparse_available()" in source
-
-
-def test_accelerate_binding_covers_both_precisions() -> None:
-    source = _accelerate_source()
-    for symbol in (
-        "_SparseFactorLU_",
-        "_SparseRefactorLU_",
-        "_SparseSolveOpaque_",
-        "_SparseDestroyOpaqueNumeric_",
-    ):
-        assert symbol in source, symbol
-    assert '"Complex_Float"' in source
-    assert '"Complex_Double"' in source
-
-
-def test_condensation_backend_switch_is_documented_and_wired() -> None:
+def test_accelerate_condensation_is_gone_and_archived() -> None:
+    # Built, measured, and removed. On S218BP the Accelerate F32 interior solver
+    # was 23% faster per frequency and 1e-2 to 4e-2 relative error against
+    # beat_cpu, against a 5e-4 gate. The record is the options document and
+    # tag archive/metal-host-condensation, not code in the tree.
+    assert not (REPO_ROOT / "src/blab/solvers/julia_local/src/BeatEngineAccelerateSparse.jl").exists()
+    assert not (REPO_ROOT / "scripts/probe-accelerate-sparse-abi.c").exists()
     coupled = (REPO_ROOT / "src/blab/solvers/julia_local/src/BeatEngineCoupled.jl").read_text(encoding="utf-8")
-    assert "BLAB_METAL_FEM_CONDENSATION" in coupled
-    assert "BLAB_ACCELERATE_SCHUR_BLOCK" in coupled
-    # The default must stay UMFPACK: the Accelerate path is faster but exceeds
-    # the 5e-4 relative-norm gate the coupled validations use.
-    assert 'get(ENV, "BLAB_METAL_FEM_CONDENSATION", "umfpack")' in coupled
-    doc = (REPO_ROOT / "docs/advanced/beat-engine-metal-condensation-options.md").read_text(encoding="utf-8")
-    assert "BLAB_METAL_FEM_CONDENSATION" in doc
-    assert "accelerate_f64" in doc
+    assert "BLAB_METAL_FEM_CONDENSATION" not in coupled
+    assert "BLAB_ACCELERATE_SCHUR_BLOCK" not in coupled
+    options = (REPO_ROOT / "docs/advanced/beat-engine-metal-condensation-options.md").read_text(encoding="utf-8")
+    assert "archive/metal-host-condensation" in options
+    assert "removed" in options
 
 
-def test_accelerate_abi_probe_is_checked_in() -> None:
-    probe = REPO_ROOT / "scripts/probe-accelerate-sparse-abi.c"
-    assert probe.is_file()
-    text = probe.read_text(encoding="utf-8")
-    assert "SparseOpaqueFactorization_Complex_Float" in text
-    assert "offsetof" in text
-
-
-def test_metal_doc_records_the_condensation_default_and_its_accuracy_cost() -> None:
+def test_metal_doc_records_the_condensation_route() -> None:
     doc = (REPO_ROOT / "docs/advanced/beat-engine-metal.md").read_text(encoding="utf-8")
-    section = doc[doc.index("### Interior solver: UMFPACK by default") :]
-    assert "0.016 dB" in section
+    section = doc[doc.index("## FEM static condensation") : doc.index("## Requirements")]
+    assert "BeatEngineCoupledCondensed.jl" in section
+    assert "### Schur block balance" in section
+    # The accuracy cost that retired Accelerate stays on record.
+    assert "archive/metal-host-condensation" in section
     assert "3.2e-3" in section
     assert "5e-4" in section
-    # The block-size trap inverts the measurement, so it has to stay documented.
-    assert "BLAB_ACCELERATE_SCHUR_BLOCK" in section
-    assert "superlinearly" in section
+    controls = doc[doc.index("## Runtime controls") :]
+    assert "BLAB_METAL_FEM_CONDENSATION" not in controls
+    assert "BLAB_ACCELERATE_SCHUR_BLOCK" not in controls
