@@ -5,6 +5,7 @@ try:
 except ImportError as exc:
     raise RuntimeError("BEAT Engine is not installed. Reinstall Boundary Lab with its declared dependencies.") from exc
 
+# The pinned fork v0.2.0 wheel still reports __version__ 0.1.0.
 if beat_engine.__version__ != "0.1.0":
     raise RuntimeError(f"Boundary Lab requires beat-engine 0.1.0; found {beat_engine.__version__}.")
 
