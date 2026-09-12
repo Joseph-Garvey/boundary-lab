@@ -25,9 +25,11 @@ from blab.solvers.beat_engine_runtime import (
     BEAT_ENGINE_BACKENDS,
     BEAT_ENGINE_CPU_BACKEND,
     BEAT_ENGINE_CUDA_BACKEND,
+    BEAT_ENGINE_METAL_BACKEND,
     BEAT_ENGINE_ROCM_BACKEND,
     DEFAULT_BEAT_ENGINE_CPU_PROJECT,
     DEFAULT_BEAT_ENGINE_CUDA_PROJECT,
+    DEFAULT_BEAT_ENGINE_METAL_PROJECT,
     DEFAULT_BEAT_ENGINE_PROJECT,
     DEFAULT_BEAT_ENGINE_ROCM_PROJECT,
     DEFAULT_BEAT_ENGINE_SOLVER_SCRIPT,
@@ -388,6 +390,8 @@ class BeatEngineBackend:
             self.capabilities = BeatEngineCpuBackend.capabilities
         elif self.beat_engine_backend == BEAT_ENGINE_ROCM_BACKEND:
             self.capabilities = BeatEngineRocmBackend.capabilities
+        elif self.beat_engine_backend == BEAT_ENGINE_METAL_BACKEND:
+            self.capabilities = BeatEngineMetalBackend.capabilities
 
     def create_session(self, request: SolveRequest) -> BeatEngineSession:
         return BeatEngineSession(
@@ -458,6 +462,19 @@ class BeatEngineRocmBackend(BeatEngineBackend):
     backend_id = "beat_rocm"
     label = "BEAT Engine (AMD ROCm)"
     beat_engine_backend = BEAT_ENGINE_ROCM_BACKEND
+    capabilities = SolverCapabilities(
+        supports_remote_assets=False,
+        supports_parallel_workers=False,
+        supports_symmetry=True,
+        supports_channel_resynthesis=True,
+        is_remote=False,
+    )
+
+
+class BeatEngineMetalBackend(BeatEngineBackend):
+    backend_id = "beat_metal"
+    label = "BEAT Engine (Apple Metal)"
+    beat_engine_backend = BEAT_ENGINE_METAL_BACKEND
     capabilities = SolverCapabilities(
         supports_remote_assets=False,
         supports_parallel_workers=False,

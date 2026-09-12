@@ -28,6 +28,7 @@ from blab.physical_model import (
 from blab.solvers.beat_engine_runtime import (
     DEFAULT_BEAT_ENGINE_CPU_PROJECT,
     DEFAULT_BEAT_ENGINE_CUDA_PROJECT,
+    DEFAULT_BEAT_ENGINE_METAL_PROJECT,
     DEFAULT_BEAT_ENGINE_ROCM_PROJECT,
     DEFAULT_BEAT_ENGINE_SYSTEM_SOLVER_SCRIPT,
     BeatEngineWorkerProcess,
@@ -45,7 +46,7 @@ from blab.system_contract import (
 
 DEFAULT_COUPLED_SOLVER_SCRIPT = DEFAULT_BEAT_ENGINE_SYSTEM_SOLVER_SCRIPT
 DEFAULT_COUPLED_CPU_PROJECT = DEFAULT_BEAT_ENGINE_CPU_PROJECT
-COUPLED_BEM_BACKENDS = {"cpu", "cuda", "rocm"}
+COUPLED_BEM_BACKENDS = {"cpu", "cuda", "rocm", "metal"}
 COUPLED_BOUNDARY_KINDS = {
     BoundaryKind.RIGID,
     BoundaryKind.MOVING,
@@ -953,6 +954,7 @@ class PhysicalSystemProductionBackend(_CoupledBackend):
             "cpu": DEFAULT_COUPLED_CPU_PROJECT,
             "cuda": DEFAULT_BEAT_ENGINE_CUDA_PROJECT,
             "rocm": DEFAULT_BEAT_ENGINE_ROCM_PROJECT,
+            "metal": DEFAULT_BEAT_ENGINE_METAL_PROJECT,
         }.get(normalized_bem_backend, DEFAULT_COUPLED_CPU_PROJECT)
         super().__init__(
             julia_executable=julia_executable,

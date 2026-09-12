@@ -44,6 +44,12 @@ Thumbs.db
 testprojectignore/
 results/
 
+# Agent folder
+.claude/
+
+# Retired in-repo Julia environments and local sysimages
+src/blab/solvers/julia_*/
+
 #gmsh examples
 gmsh/gmsh-4.15.2-Windows64/examples/
 

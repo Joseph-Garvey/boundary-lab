@@ -25,14 +25,17 @@ DEFAULT_BEAT_ENGINE_SYSTEM_SOLVER_SCRIPT = engine_paths().system_solver
 DEFAULT_BEAT_ENGINE_CPU_PROJECT = engine_paths("cpu").project
 DEFAULT_BEAT_ENGINE_CUDA_PROJECT = engine_paths("cuda").project
 DEFAULT_BEAT_ENGINE_ROCM_PROJECT = engine_paths("rocm").project
+DEFAULT_BEAT_ENGINE_METAL_PROJECT = engine_paths("metal").project
 DEFAULT_BEAT_ENGINE_PROJECT = DEFAULT_BEAT_ENGINE_CPU_PROJECT
 BEAT_ENGINE_CUDA_BACKEND = "cuda"
 BEAT_ENGINE_CPU_BACKEND = "cpu"
 BEAT_ENGINE_ROCM_BACKEND = "rocm"
+BEAT_ENGINE_METAL_BACKEND = "metal"
 BEAT_ENGINE_BACKENDS = {
     BEAT_ENGINE_CUDA_BACKEND,
     BEAT_ENGINE_CPU_BACKEND,
     BEAT_ENGINE_ROCM_BACKEND,
+    BEAT_ENGINE_METAL_BACKEND,
 }
 
 
@@ -50,6 +53,10 @@ def normalize_beat_engine_backend(value: object) -> str:
         "rocm": BEAT_ENGINE_ROCM_BACKEND,
         "amd": BEAT_ENGINE_ROCM_BACKEND,
         "amdgpu": BEAT_ENGINE_ROCM_BACKEND,
+        "beat_metal": BEAT_ENGINE_METAL_BACKEND,
+        "metal": BEAT_ENGINE_METAL_BACKEND,
+        "apple": BEAT_ENGINE_METAL_BACKEND,
+        "mps": BEAT_ENGINE_METAL_BACKEND,
     }
     backend = aliases.get(text, text)
     if backend not in BEAT_ENGINE_BACKENDS:
@@ -62,6 +69,8 @@ def default_beat_engine_project(beat_engine_backend: str) -> Path:
         return DEFAULT_BEAT_ENGINE_CPU_PROJECT
     if beat_engine_backend == BEAT_ENGINE_ROCM_BACKEND:
         return DEFAULT_BEAT_ENGINE_ROCM_PROJECT
+    if beat_engine_backend == BEAT_ENGINE_METAL_BACKEND:
+        return DEFAULT_BEAT_ENGINE_METAL_PROJECT
     return DEFAULT_BEAT_ENGINE_CUDA_PROJECT
 
 
@@ -72,6 +81,8 @@ def _julia_project_backend_label(project_path: Path, beat_engine_backend: str | 
         return "BEAT Engine (CPU)"
     if beat_engine_backend == BEAT_ENGINE_ROCM_BACKEND or project_path == DEFAULT_BEAT_ENGINE_ROCM_PROJECT:
         return "BEAT Engine (AMD ROCm)"
+    if beat_engine_backend == BEAT_ENGINE_METAL_BACKEND or project_path == DEFAULT_BEAT_ENGINE_METAL_PROJECT:
+        return "BEAT Engine (Apple Metal)"
     return "the selected BEAT Engine backend"
 
 
