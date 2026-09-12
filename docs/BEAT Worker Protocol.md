@@ -14,7 +14,7 @@ then emits the resulting object as a single JSON line on stdout, with `type: rea
 | Field | Meaning |
 |---|---|
 | `protocol` | Name `beat-worker`, integer version `1` |
-| `engine` | Name `BEAT Engine`, reported version `0.1.0` (fork v0.2.0 wheel) |
+| `engine` | Name `BEAT Engine`, release version `0.2.1` |
 | `contracts` | Supported versions for system request, compiled system, system result, and field array |
 | `operations` | `solve` and `bem_field` |
 | `precisions` | `float32` and `float64` |
