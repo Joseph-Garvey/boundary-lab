@@ -192,6 +192,7 @@ def test_project_cli_exposes_validate_and_solve_commands() -> None:
 
 
 def test_auto_backend_prefers_functional_cuda(monkeypatch) -> None:
+    monkeypatch.setattr(headless_module, "_is_apple_silicon", lambda: False)
     monkeypatch.setattr(headless_module, "_command_available", lambda _command: True)
     calls = []
 
@@ -207,11 +208,52 @@ def test_auto_backend_prefers_functional_cuda(monkeypatch) -> None:
 
 
 def test_auto_backend_falls_back_to_cpu_when_cuda_is_unavailable(monkeypatch) -> None:
+    monkeypatch.setattr(headless_module, "_is_apple_silicon", lambda: False)
     monkeypatch.setattr(headless_module, "_command_available", lambda _command: True)
     monkeypatch.setattr(
         headless_module.subprocess,
         "run",
         lambda *_args, **_kwargs: SimpleNamespace(returncode=1),
+    )
+
+    assert resolve_headless_backend() == "beat_cpu"
+
+
+def test_auto_backend_prefers_functional_metal_on_apple_silicon(monkeypatch) -> None:
+    monkeypatch.setattr(headless_module, "_is_apple_silicon", lambda: True)
+    monkeypatch.setattr(headless_module, "_command_available", lambda command: command != "nvidia-smi")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(headless_module.subprocess, "run", fake_run)
+
+    assert resolve_headless_backend("beat_auto") == "beat_metal"
+    assert "Metal.functional()" in calls[0][-1]
+    assert calls[0][2] == f"--project={headless_module.DEFAULT_BEAT_ENGINE_METAL_PROJECT}"
+
+
+def test_auto_backend_falls_back_to_cpu_when_metal_is_unavailable(monkeypatch) -> None:
+    monkeypatch.setattr(headless_module, "_is_apple_silicon", lambda: True)
+    monkeypatch.setattr(headless_module, "_command_available", lambda _command: True)
+    monkeypatch.setattr(
+        headless_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=1),
+    )
+
+    assert resolve_headless_backend() == "beat_cpu"
+
+
+def test_auto_backend_uses_cpu_without_julia(monkeypatch) -> None:
+    monkeypatch.setattr(headless_module, "_is_apple_silicon", lambda: True)
+    monkeypatch.setattr(headless_module, "_command_available", lambda _command: False)
+    monkeypatch.setattr(
+        headless_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("auto mode should not probe without Julia"),
     )
 
     assert resolve_headless_backend() == "beat_cpu"
@@ -227,6 +269,7 @@ def test_explicit_backend_does_not_probe_cuda(monkeypatch) -> None:
     assert resolve_headless_backend("beat_cpu") == "beat_cpu"
     assert resolve_headless_backend("beat_cuda") == "beat_cuda"
     assert resolve_headless_backend("beat_rocm") == "beat_rocm"
+    assert resolve_headless_backend("beat_metal") == "beat_metal"
     assert resolve_headless_backend("beat_cpu_condensed") == "beat_cpu"
 
 

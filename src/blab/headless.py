@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,7 +33,7 @@ from blab.solve_results import (
     bem_boundary_result_domain,
     fem_volume_result_domain,
 )
-from blab.solvers.beat_engine_runtime import DEFAULT_BEAT_ENGINE_CUDA_PROJECT
+from blab.solvers.beat_engine_runtime import DEFAULT_BEAT_ENGINE_CUDA_PROJECT, DEFAULT_BEAT_ENGINE_METAL_PROJECT
 from blab.solvers.coupled_backend import PhysicalSystemProductionBackend, validate_solve_plan
 from blab.solvers.registry import normalize_backend_id
 from blab.system_contract import (
@@ -151,7 +153,10 @@ def resolve_headless_backend(
     julia_executable: str = "julia",
     cuda_probe_timeout_s: float = 30.0,
 ) -> str:
-    """Resolve the headless BEAT backend, preferring functional CUDA in auto mode."""
+    """Resolve the headless BEAT backend, preferring a functional GPU in auto mode.
+
+    Auto mode probes Metal on Apple Silicon and CUDA elsewhere, falling back to CPU.
+    """
 
     requested = str(backend_id or HEADLESS_BACKEND_AUTO).strip().lower()
     if requested in {"auto", "beat"}:
@@ -162,14 +167,20 @@ def resolve_headless_backend(
         raise ValueError(f"Unknown headless backend {backend_id!r}; expected " + ", ".join(HEADLESS_BACKEND_IDS))
     if requested != HEADLESS_BACKEND_AUTO:
         return requested
-    if not _command_available("nvidia-smi") or not _command_available(julia_executable):
+    if not _command_available(julia_executable):
+        return "beat_cpu"
+    if _is_apple_silicon():
+        project, gpu_module, gpu_backend = DEFAULT_BEAT_ENGINE_METAL_PROJECT, "Metal", "beat_metal"
+    elif _command_available("nvidia-smi"):
+        project, gpu_module, gpu_backend = DEFAULT_BEAT_ENGINE_CUDA_PROJECT, "CUDA", "beat_cuda"
+    else:
         return "beat_cpu"
     command = [
         julia_executable,
         "--startup-file=no",
-        f"--project={DEFAULT_BEAT_ENGINE_CUDA_PROJECT}",
+        f"--project={project}",
         "-e",
-        "import CUDA; exit(CUDA.functional() ? 0 : 1)",
+        f"import {gpu_module}; exit({gpu_module}.functional() ? 0 : 1)",
     ]
     try:
         probe = subprocess.run(
@@ -182,7 +193,11 @@ def resolve_headless_backend(
         )
     except (OSError, subprocess.TimeoutExpired):
         return "beat_cpu"
-    return "beat_cuda" if probe.returncode == 0 else "beat_cpu"
+    return gpu_backend if probe.returncode == 0 else "beat_cpu"
+
+
+def _is_apple_silicon() -> bool:
+    return sys.platform == "darwin" and platform.machine() == "arm64"
 
 
 def load_headless_solve_spec(path: str | Path | None) -> HeadlessSolveSpec:

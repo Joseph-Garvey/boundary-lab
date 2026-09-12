@@ -72,7 +72,7 @@ To prepare the Julia environment, from the repository root with Boundary Lab's P
 python -m beat_engine instantiate --backend metal
 ```
 
-Select **BEAT Engine (Apple Metal)** in Preferences, or pass `--backend beat_metal` on the command line. Automatic backend selection does not choose Metal.
+Select **BEAT Engine (Apple Metal)** in Preferences. On the command line, the default `--backend beat_auto` uses Metal on Apple Silicon when it is functional; pass `--backend beat_metal` to require it.
 
 ### BEAT Engine CPU Solver Requirements
 

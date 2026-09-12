@@ -46,9 +46,10 @@ symmetry, and physical-group mappings. The old all-enabled-mesh stitching and
 conversion through legacy radiator inputs have been retired. Saved legacy
 radiator assignments remain readable for project migration.
 
-The default `--backend beat_auto` always selects a BEAT Engine backend. It probes
-the configured Julia CUDA environment and uses `beat_cuda` when CUDA is
-functional; otherwise it falls back to `beat_cpu`. Use an explicit
+The default `--backend beat_auto` always selects a BEAT Engine backend. On Apple
+Silicon it probes the Julia Metal environment and uses `beat_metal` when Metal is
+functional; elsewhere it probes the CUDA environment and uses `beat_cuda` when
+CUDA is functional. Otherwise it falls back to `beat_cpu`. Use an explicit
 `--backend beat_cpu`, `--backend beat_cuda`, `--backend beat_rocm`, or
 `--backend beat_metal` to disable
 automatic selection. `beat_cpu` uses the ordinary CPU path for exterior-only
