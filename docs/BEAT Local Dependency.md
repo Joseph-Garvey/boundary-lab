@@ -12,7 +12,7 @@ python -m beat_engine paths --backend cpu
 ```
 
 Julia is installed separately; the wheel does not provide Julia or GPU drivers.
-Use `--backend cuda` or `--backend rocm` to prepare the corresponding environment.
+Use `--backend cuda`, `--backend rocm`, or `--backend metal` to prepare the corresponding environment.
 Hardware availability is a separate qualification from successful installation.
 
 Run these commands with Boundary Lab's Python environment activated. On Windows,
@@ -24,7 +24,7 @@ BEAT into another Python environment does not configure Boundary Lab's environme
 Update the Boundary Lab checkout, then rerun its installer or the normal
 `python -m pip install -e ".[gui]"` command. Boundary Lab selects its supported
 engine release automatically. After an engine update, prepare each backend you
-use again with `python -m beat_engine instantiate --backend cpu` (or `cuda`/`rocm`),
+use again with `python -m beat_engine instantiate --backend cpu` (or `cuda`/`rocm`/`metal`),
 then inspect `doctor` output. The Windows installer's solver prompts perform
 environment preparation and include CUDA/ROCm runtime checks.
 

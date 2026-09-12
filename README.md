@@ -61,6 +61,19 @@ python -m beat_engine instantiate --backend rocm
 
 The Windows installer can detect an existing AMD SDK and prepare the ROCm environment. See [BEAT Engine AMD ROCm setup](docs/advanced/beat-engine-rocm.md) for SDK configuration and runtime verification.
 
+### BEAT Engine Apple Metal GPU Solver Requirements
+
+* Apple Silicon Mac (M-series)
+* [Julia](https://julialang.org/downloads/manual-downloads/) 1.12 installed and available on `PATH`
+
+To prepare the Julia environment, from the repository root with Boundary Lab's Python environment activated, run:
+
+```bash
+python -m beat_engine instantiate --backend metal
+```
+
+Select **BEAT Engine (Apple Metal)** in Preferences, or pass `--backend beat_metal` on the command line. Automatic backend selection does not choose Metal.
+
 ### BEAT Engine CPU Solver Requirements
 
 * Intel, AMD, or ARM CPU

@@ -154,7 +154,7 @@ process, and no intermediate raw mesh is written or reloaded.
 
 ## Solver setup
 
-Boundary Lab offers three local BEAT Engine backends. All support exterior
+Boundary Lab offers four local BEAT Engine backends. All support exterior
 BEM and coupled FEM-BEM systems, including X and XY symmetry.
 
 | Backend | Hardware/runtime | Exterior BEM | Coupled FEM-BEM |
@@ -162,6 +162,7 @@ BEM and coupled FEM-BEM systems, including X and XY symmetry.
 | BEAT Engine CPU | Julia and CPU BLAS/LAPACK | Yes | Yes |
 | BEAT Engine Nvidia CUDA | Julia and supported NVIDIA GPU | Yes | Yes |
 | BEAT Engine AMD ROCm | Julia, AMDGPU.jl, and a functional ROCm SDK | Yes | Yes |
+| BEAT Engine Apple Metal | Julia 1.12 and an Apple Silicon Mac | Yes | Yes |
 
 Bempp and the legacy HTTP solve server are retired. Saved backend selections
 for either migrate to BEAT CPU. The ROCm path uses GPU-resident regular and Duffy singular operator

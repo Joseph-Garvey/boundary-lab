@@ -49,7 +49,8 @@ radiator assignments remain readable for project migration.
 The default `--backend beat_auto` always selects a BEAT Engine backend. It probes
 the configured Julia CUDA environment and uses `beat_cuda` when CUDA is
 functional; otherwise it falls back to `beat_cpu`. Use an explicit
-`--backend beat_cpu`, `--backend beat_cuda`, or `--backend beat_rocm` to disable
+`--backend beat_cpu`, `--backend beat_cuda`, `--backend beat_rocm`, or
+`--backend beat_metal` to disable
 automatic selection. `beat_cpu` uses the ordinary CPU path for exterior-only
 projects, sparse UMFPACK pressure FEM for interior-only projects, and exact FEM
 interface condensation for coupled production projects.
